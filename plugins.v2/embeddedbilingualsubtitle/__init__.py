@@ -174,6 +174,14 @@ def _extract_json_text(text: str) -> str:
     return text
 
 
+def _strip_markdown_fences(text: str) -> str:
+    text = (text or "").strip()
+    fenced_match = re.search(r"```(?:json|text|markdown)?\s*(.*?)```", text, re.S)
+    if fenced_match:
+        return fenced_match.group(1).strip()
+    return text
+
+
 def _timing_overlap(left: SubtitleCue, right: SubtitleCue) -> int:
     return max(0, min(left.end_ms, right.end_ms) - max(left.start_ms, right.start_ms))
 
@@ -241,7 +249,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -1240,6 +1248,10 @@ class EmbeddedBilingualSubtitle(_PluginBase):
 
     def __translate_batch(self, cues: List[SubtitleCue]) -> List[str]:
         endpoint = self.__build_translate_endpoint(self._translate_url)
+        prompt_lines = [
+            f"{cue.index}\t{cue.text.replace(chr(10), ' / ')}"
+            for cue in cues
+        ]
         payload = {
             "model": self._translate_model,
             "temperature": 0.2,
@@ -1249,16 +1261,17 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     "content": (
                         "你是专业影视字幕译者。"
                         "请将输入的英文字幕逐条翻译成简体中文。"
-                        "必须保持索引一一对应，不要省略，不要增加解释。"
-                        "只返回 JSON 数组，格式为"
+                        "必须保持顺序与数量一一对应，不要省略，不要增加解释。"
+                        "优先输出每行一条，严格使用“索引<TAB>译文”格式，例如“1\t你好”。"
+                        "如果模型支持结构化输出，也可以返回 JSON 数组，格式为"
                         "[{\"index\":1,\"translation\":\"...\"}]。"
                     ),
                 },
                 {
                     "role": "user",
-                    "content": json.dumps(
-                        [{"index": cue.index, "text": cue.text} for cue in cues],
-                        ensure_ascii=False,
+                    "content": (
+                        "请把下面内容翻译成简体中文，保持索引不变，只返回翻译结果：\n"
+                        + "\n".join(prompt_lines)
                     ),
                 },
             ],
@@ -1287,15 +1300,84 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             message = "".join(part.get("text", "") for part in message if isinstance(part, dict))
         if not message:
             raise RuntimeError("翻译接口未返回有效内容")
+        return self.__parse_translate_output(message=message, cues=cues)
 
+    @staticmethod
+    def __build_translate_endpoint(base_url: str) -> str:
+        normalized = (base_url or "").strip().rstrip("/")
+        if normalized.endswith("/chat/completions"):
+            return normalized
+        if normalized.endswith("/v1"):
+            return f"{normalized}/chat/completions"
+        return f"{normalized}/v1/chat/completions"
+
+    def __parse_translate_output(self, message: str, cues: List[SubtitleCue]) -> List[str]:
+        json_error = None
         try:
-            items = json.loads(_extract_json_text(message))
+            return self.__parse_translate_json(message=message, cues=cues)
         except Exception as err:
-            raise RuntimeError(f"翻译结果解析失败：{str(err)}")
+            json_error = str(err)
+
+        plain_text = _strip_markdown_fences(message)
+        plain_text = plain_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        lines = [line.strip() for line in plain_text.split("\n") if line.strip()]
+
+        indexed_map: Dict[int, str] = {}
+        for line in lines:
+            indexed = self.__parse_indexed_translation_line(line)
+            if indexed:
+                index, translation = indexed
+                indexed_map[index] = translation
+
+        if indexed_map:
+            translations = []
+            for cue in cues:
+                translation = indexed_map.get(cue.index)
+                if not translation:
+                    raise RuntimeError(f"翻译结果缺少索引 {cue.index}")
+                translations.append(translation)
+            return translations
+
+        cleaned_lines = [self.__clean_translation_line(line) for line in lines]
+        cleaned_lines = [line for line in cleaned_lines if line]
+
+        if len(cues) == 1:
+            single_text = "\n".join(cleaned_lines).strip() or self.__clean_translation_line(plain_text)
+            if single_text:
+                return [single_text]
+
+        if len(cleaned_lines) == len(cues):
+            return cleaned_lines
+
+        if len(cleaned_lines) > len(cues):
+            trimmed = cleaned_lines[:len(cues)]
+            if all(trimmed):
+                return trimmed
+
+        raise RuntimeError(
+            f"翻译结果无法匹配字幕条数，期望 {len(cues)} 条，收到 {len(cleaned_lines)} 条；JSON解析错误：{json_error or '-'}"
+        )
+
+    def __parse_translate_json(self, message: str, cues: List[SubtitleCue]) -> List[str]:
+        items = json.loads(_extract_json_text(message))
+        if isinstance(items, dict):
+            for key in ["translations", "items", "data", "result"]:
+                value = items.get(key)
+                if isinstance(value, list):
+                    items = value
+                    break
+            else:
+                if len(cues) == 1 and items.get("translation"):
+                    return [_normalize_text(str(items.get("translation")))]
         if not isinstance(items, list):
             raise RuntimeError("翻译结果格式错误，返回内容不是数组")
 
-        translated_map = {}
+        if items and all(isinstance(item, str) for item in items):
+            if len(items) != len(cues):
+                raise RuntimeError("翻译字符串数组数量与字幕条数不一致")
+            return [_normalize_text(item) for item in items]
+
+        translated_map: Dict[int, str] = {}
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1303,7 +1385,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 index = int(item.get("index"))
             except Exception:
                 continue
-            translation = _normalize_text(str(item.get("translation") or ""))
+            translation = _normalize_text(str(item.get("translation") or item.get("text") or ""))
             if translation:
                 translated_map[index] = translation
 
@@ -1316,13 +1398,32 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         return translations
 
     @staticmethod
-    def __build_translate_endpoint(base_url: str) -> str:
-        normalized = (base_url or "").strip().rstrip("/")
-        if normalized.endswith("/chat/completions"):
-            return normalized
-        if normalized.endswith("/v1"):
-            return f"{normalized}/chat/completions"
-        return f"{normalized}/v1/chat/completions"
+    def __parse_indexed_translation_line(line: str) -> Optional[Tuple[int, str]]:
+        patterns = [
+            r"^\s*<id>(\d+)</id>\s*(.+)$",
+            r"^\s*<index>(\d+)</index>\s*(.+)$",
+            r"^\s*(\d+)\s*[\t|｜]+\s*(.+)$",
+            r"^\s*(\d+)\s*[\.、:：\)\]-]\s*(.+)$",
+        ]
+        for pattern in patterns:
+            match = re.match(pattern, line)
+            if not match:
+                continue
+            index = int(match.group(1))
+            translation = EmbeddedBilingualSubtitle.__clean_translation_line(match.group(2))
+            if translation:
+                return index, translation
+        return None
+
+    @staticmethod
+    def __clean_translation_line(text: str) -> str:
+        text = (text or "").strip()
+        text = re.sub(r"^\s*(翻译结果|译文|translation)\s*[:：]\s*", "", text, flags=re.I)
+        text = re.sub(r"^\s*(\d+)\s*[\.、:：\)\]-]\s*", "", text)
+        text = re.sub(r"^\s*(\d+)\s*[\t|｜]+\s*", "", text)
+        text = re.sub(r"^\s*[-*]\s*", "", text)
+        text = text.strip().strip('"').strip("'").strip()
+        return _normalize_text(text)
 
     def __build_output_path(self, file_path: Path) -> Path:
         suffix = (self._output_suffix or "zh.default").strip().strip(".")

@@ -249,7 +249,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -372,6 +372,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "methods": ["POST"],
                 "summary": "测试硅基流动翻译接口",
                 "description": "使用当前保存的模型和测试文本执行一次翻译测试",
+            },
+            {
+                "path": "/clear_history",
+                "endpoint": self._api_clear_history,
+                "methods": ["POST"],
+                "summary": "清空处理记录",
+                "description": "清空插件处理历史与最近一次测试结果",
             }
         ]
 
@@ -731,6 +738,35 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         success = latest_test.get("success")
         success_text = "未测试" if success is None else ("成功" if success else "失败")
         success_color = "success" if success else ("error" if success is False else "info")
+        history = self.get_data("history") or []
+        headers = [
+            {"title": "时间", "key": "time"},
+            {"title": "状态", "key": "status"},
+            {"title": "来源", "key": "source"},
+            {"title": "模式", "key": "mode"},
+            {"title": "文件", "key": "file_path"},
+            {"title": "说明", "key": "reason"},
+        ]
+        items = []
+        for item in history[:100]:
+            status_text = {
+                "success": "成功",
+                "failed": "失败",
+                "skipped": "跳过",
+            }.get(item.get("status"), item.get("status") or "-")
+            items.append(
+                {
+                    "time": item.get("time") or "-",
+                    "status": status_text,
+                    "source": item.get("source") or "-",
+                    "mode": item.get("mode") or "-",
+                    "file_path": item.get("file_path") or "-",
+                    "reason": item.get("reason") or "-",
+                }
+            )
+        success_count = len([item for item in history if item.get("status") == "success"])
+        failed_count = len([item for item in history if item.get("status") == "failed"])
+        skipped_count = len([item for item in history if item.get("status") == "skipped"])
         return [
             {
                 "component": "div",
@@ -752,6 +788,20 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                         "events": {
                             "click": {
                                 "api": f"plugin/{self.__class__.__name__}/test_translate?apikey={settings.API_TOKEN}",
+                                "method": "post",
+                            }
+                        },
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "prepend-icon": "mdi-delete-sweep",
+                            "variant": "text",
+                        },
+                        "text": "清空处理记录",
+                        "events": {
+                            "click": {
+                                "api": f"plugin/{self.__class__.__name__}/clear_history?apikey={settings.API_TOKEN}",
                                 "method": "post",
                             }
                         },
@@ -786,6 +836,58 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     }
                 ],
             },
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "info",
+                                    "variant": "tonal",
+                                    "text": (
+                                        f"累计处理记录：{len(history)} 条\n"
+                                        f"成功：{success_count}  失败：{failed_count}  跳过：{skipped_count}\n"
+                                        "这里会展示最近 100 条处理记录，便于查看目录扫描、原盘识别、翻译失败等结果。"
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "component": "VRow",
+                "props": {
+                    "style": {
+                        "overflow": "hidden",
+                    }
+                },
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VDataTableVirtual",
+                                "props": {
+                                    "class": "text-sm",
+                                    "headers": headers,
+                                    "items": items,
+                                    "height": "28rem",
+                                    "density": "compact",
+                                    "fixed-header": True,
+                                    "hide-no-data": False,
+                                    "hover": True,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
         ]
 
     def _api_test_translate(self) -> dict:
@@ -795,6 +897,12 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             "message": result.get("reason") or result.get("output") or "",
             "data": result,
         }
+
+    def _api_clear_history(self) -> dict:
+        self.save_data("history", [])
+        self.save_data("last_translate_test", {})
+        logger.info("内嵌双语字幕合成历史记录已清空")
+        return {"success": True}
 
     def stop_service(self):
         try:
@@ -978,7 +1086,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 mode="runtime",
                 reason=str(err),
             )
-        self.__record_history(result)
+        self.__record_history(result, source=source)
         self.__notify_single_result(result=result, source=source)
         if result.status == "success":
             logger.info(f"双语字幕生成成功：{result.file_path} -> {result.output_path}")
@@ -1528,12 +1636,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         suffix = (self._output_suffix or "zh.default").strip().strip(".")
         return file_path.with_name(f"{file_path.stem}.{suffix}.srt")
 
-    def __record_history(self, result: ProcessResult):
+    def __record_history(self, result: ProcessResult, source: str):
         history = self.get_data("history") or []
         history.insert(
             0,
             {
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source": source,
                 "file_path": result.file_path,
                 "status": result.status,
                 "mode": result.mode,

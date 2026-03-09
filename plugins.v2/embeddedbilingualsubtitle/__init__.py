@@ -1,7 +1,9 @@
+import queue
 import json
 import re
 import subprocess
 import threading
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,6 +89,14 @@ class ProcessResult:
     output_path: str = ""
     english_stream: str = ""
     chinese_stream: str = ""
+
+
+@dataclass
+class QueueTask:
+    task_id: str
+    file_path: str
+    source: str
+    run_id: str
 
 
 def _normalize_text(text: str) -> str:
@@ -182,6 +192,17 @@ def _strip_markdown_fences(text: str) -> str:
     return text
 
 
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _compare_text(text: str) -> str:
+    text = _normalize_text(text).lower()
+    text = re.sub(r"[\[\]\(\)\{\}<>]", " ", text)
+    text = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _timing_overlap(left: SubtitleCue, right: SubtitleCue) -> int:
     return max(0, min(left.end_ms, right.end_ms) - max(left.start_ms, right.start_ms))
 
@@ -249,7 +270,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.1.3"
+    plugin_version = "1.2.0"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -278,8 +299,14 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     _test_onlyonce = False
     _test_text = DEFAULT_TEST_TEXT
     _event = ThreadEvent()
+    _task_queue = None
+    _worker_thread = None
+    _current_task = None
+    _queue_lock = threading.Lock()
+    _run_states = None
 
     def init_plugin(self, config: dict = None):
+        self._run_states = {}
         if config:
             self._enabled = bool(config.get("enabled"))
             self._notify = bool(config.get("notify", True))
@@ -303,6 +330,8 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             self._test_text = (config.get("test_text") or DEFAULT_TEST_TEXT).strip()
 
         self.stop_service()
+        self._event.clear()
+        self.__ensure_worker()
 
         if self._enabled or self._onlyonce or self._test_onlyonce:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -739,6 +768,19 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         success_text = "未测试" if success is None else ("成功" if success else "失败")
         success_color = "success" if success else ("error" if success is False else "info")
         history = self.get_data("history") or []
+        run_states = sorted(
+            list((self._run_states or {}).values()),
+            key=lambda item: item.get("queued_at") or "",
+            reverse=True,
+        )
+        active_run = None
+        for state in run_states:
+            if state.get("running") or (
+                state.get("total", 0) > 0 and state.get("completed", 0) < state.get("total", 0)
+            ):
+                active_run = state
+                break
+        queue_size = self._task_queue.qsize() if self._task_queue else 0
         headers = [
             {"title": "时间", "key": "time"},
             {"title": "状态", "key": "status"},
@@ -746,6 +788,29 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             {"title": "模式", "key": "mode"},
             {"title": "文件", "key": "file_path"},
             {"title": "说明", "key": "reason"},
+        ]
+        run_headers = [
+            {"title": "时间", "key": "queued_at"},
+            {"title": "来源", "key": "source"},
+            {"title": "总数", "key": "total"},
+            {"title": "完成", "key": "completed"},
+            {"title": "成功", "key": "success"},
+            {"title": "失败", "key": "failed"},
+            {"title": "跳过", "key": "skipped"},
+            {"title": "阶段", "key": "stage"},
+        ]
+        run_items = [
+            {
+                "queued_at": item.get("queued_at") or "-",
+                "source": item.get("source") or "-",
+                "total": item.get("total", 0),
+                "completed": item.get("completed", 0),
+                "success": item.get("success", 0),
+                "failed": item.get("failed", 0),
+                "skipped": item.get("skipped", 0),
+                "stage": item.get("stage") or "-",
+            }
+            for item in run_states[:20]
         ]
         items = []
         for item in history[:100]:
@@ -846,6 +911,62 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                             {
                                 "component": "VAlert",
                                 "props": {
+                                    "type": "info" if active_run else "success",
+                                    "variant": "tonal",
+                                    "text": (
+                                        f"队列待处理：{queue_size} 个\n"
+                                        f"当前任务：{(active_run or {}).get('current_file') or '-'}\n"
+                                        f"当前阶段：{(active_run or {}).get('stage') or '空闲'}\n"
+                                        f"当前进度：{(active_run or {}).get('completed', 0)}/{(active_run or {}).get('total', 0)}\n"
+                                        f"当前批次结果：成功 {(active_run or {}).get('success', 0)} / "
+                                        f"失败 {(active_run or {}).get('failed', 0)} / "
+                                        f"跳过 {(active_run or {}).get('skipped', 0)}"
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "component": "VRow",
+                "props": {
+                    "style": {
+                        "overflow": "hidden",
+                    }
+                },
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VDataTableVirtual",
+                                "props": {
+                                    "class": "text-sm",
+                                    "headers": run_headers,
+                                    "items": run_items,
+                                    "height": "16rem",
+                                    "density": "compact",
+                                    "fixed-header": True,
+                                    "hide-no-data": False,
+                                    "hover": True,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VAlert",
+                                "props": {
                                     "type": "info",
                                     "variant": "tonal",
                                     "text": (
@@ -904,17 +1025,52 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         logger.info("内嵌双语字幕合成历史记录已清空")
         return {"success": True}
 
+    def __ensure_worker(self):
+        if self._task_queue is None:
+            self._task_queue = queue.Queue()
+        if self._worker_thread and self._worker_thread.is_alive():
+            return
+        self._worker_thread = threading.Thread(target=self.__consume_tasks, daemon=True)
+        self._worker_thread.start()
+
     def stop_service(self):
         try:
+            self._event.set()
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
-                    self._event.set()
                     self._scheduler.shutdown()
-                    self._event.clear()
                 self._scheduler = None
+            if self._task_queue:
+                while not self._task_queue.empty():
+                    try:
+                        self._task_queue.get_nowait()
+                        self._task_queue.task_done()
+                    except Exception:
+                        break
+            self._current_task = None
         except Exception as err:
             logger.error(f"停止内嵌双语字幕合成服务失败：{str(err)}")
+
+    def __consume_tasks(self):
+        while not self._event.is_set():
+            try:
+                task = self._task_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            if task is None:
+                continue
+            self._current_task = task
+            self.__update_run_state(
+                task.run_id,
+                current_file=task.file_path,
+                stage="处理中",
+                running=True,
+            )
+            result = self.__process_single_path(Path(task.file_path), source=task.source)
+            self.__advance_run_state(task.run_id, result)
+            self._current_task = None
+            self._task_queue.task_done()
 
     @eventmanager.register(EventType.PluginAction)
     def handle_command(self, event: Event = None):
@@ -946,15 +1102,16 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             title="开始扫描内嵌字幕并生成双语字幕",
             userid=event_data.get("user"),
         )
-        results = self.__collect_and_process_paths(source="command")
-        success = len([item for item in results if item.status == "success"])
-        failed = len([item for item in results if item.status == "failed"])
-        skipped = len([item for item in results if item.status == "skipped"])
+        summary = self.__collect_and_enqueue_paths(source="command")
         self.post_message(
             channel=event_data.get("channel"),
-            title="内嵌双语字幕扫描完成",
+            title="内嵌双语字幕任务已加入队列",
             userid=event_data.get("user"),
-            text=f"成功 {success} 个，失败 {failed} 个，跳过 {skipped} 个。",
+            text=(
+                f"已入队 {summary.get('queued', 0)} 个，"
+                f"立即失败 {summary.get('failed', 0)} 个，"
+                f"立即跳过 {summary.get('skipped', 0)} 个。"
+            ),
         )
 
     @eventmanager.register(EventType.TransferComplete)
@@ -967,20 +1124,23 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         if transferinfo.target_diritem and transferinfo.target_diritem.storage != "local":
             logger.warn(f"内嵌双语字幕合成不支持非本地存储：{transferinfo.target_diritem.storage}")
             return
-        for file_item in transferinfo.file_list_new or []:
-            self.__process_single_path(Path(file_item), source="transfer")
+        self.__enqueue_paths(
+            paths=[Path(file_item) for file_item in transferinfo.file_list_new or []],
+            source="transfer",
+        )
 
     def __run_once_scan(self):
-        self.__collect_and_process_paths(source="once")
+        self.__collect_and_enqueue_paths(source="once")
 
     def __run_translate_test_once(self):
         self.__run_translate_test(source="config")
 
     def __scheduled_scan(self):
-        self.__collect_and_process_paths(source="cron")
+        self.__collect_and_enqueue_paths(source="cron")
 
-    def __collect_and_process_paths(self, source: str) -> List[ProcessResult]:
-        results: List[ProcessResult] = []
+    def __collect_and_enqueue_paths(self, source: str) -> Dict[str, int]:
+        immediate_results: List[ProcessResult] = []
+        paths_to_queue: List[Path] = []
         custom_files = [line.strip() for line in self._custom_files.splitlines() if line.strip()]
         if custom_files:
             logger.info(f"内嵌双语字幕合成开始处理自定义文件，共 {len(custom_files)} 个")
@@ -989,7 +1149,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 expanded_paths.extend(self.__expand_custom_path(Path(path_text)))
             expanded_paths = self.__deduplicate_paths(expanded_paths)
             if not expanded_paths:
-                results.append(
+                immediate_results.append(
                     ProcessResult(
                         file_path="\n".join(custom_files),
                         status="failed",
@@ -998,35 +1158,113 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     )
                 )
             else:
-                for file_path in expanded_paths:
-                    results.append(self.__process_single_path(file_path, source=source))
-            self.__notify_batch_summary(results, source=source)
-            return results
+                paths_to_queue.extend(expanded_paths)
+            return self.__enqueue_or_finalize(source=source, paths=paths_to_queue, immediate_results=immediate_results)
 
         scan_paths = [line.strip() for line in self._scan_paths.splitlines() if line.strip()]
         exclude_paths = [Path(line.strip()) for line in self._exclude_paths.splitlines() if line.strip()]
         if not scan_paths:
             logger.warn("内嵌双语字幕合成未配置扫描路径")
-            return results
+            return {"queued": 0, "failed": 0, "skipped": 0}
 
         for path_text in scan_paths:
             if self._event.is_set():
-                return results
+                return self.__enqueue_or_finalize(source=source, paths=paths_to_queue, immediate_results=immediate_results)
             root = Path(path_text)
             if not root.exists():
                 reason = f"扫描路径不存在：{path_text}"
                 logger.warn(reason)
-                results.append(ProcessResult(file_path=path_text, status="failed", mode="scan", reason=reason))
+                immediate_results.append(ProcessResult(file_path=path_text, status="failed", mode="scan", reason=reason))
                 continue
             logger.info(f"开始扫描媒体目录：{root}")
             for file_path in SystemUtils.list_files(root, extensions=settings.RMT_MEDIAEXT):
                 if self._event.is_set():
-                    return results
+                    return self.__enqueue_or_finalize(source=source, paths=paths_to_queue, immediate_results=immediate_results)
                 if self.__is_excluded(file_path, exclude_paths):
                     continue
-                results.append(self.__process_single_path(file_path, source=source))
-        self.__notify_batch_summary(results, source=source)
-        return results
+                paths_to_queue.append(file_path)
+        return self.__enqueue_or_finalize(source=source, paths=paths_to_queue, immediate_results=immediate_results)
+
+    def __enqueue_or_finalize(self, source: str, paths: List[Path], immediate_results: List[ProcessResult]) -> Dict[str, int]:
+        queued = self.__enqueue_paths(paths=self.__deduplicate_paths(paths), source=source)
+        for result in immediate_results:
+            self.__record_history(result, source=source)
+        if immediate_results:
+            self.__notify_batch_summary(immediate_results, source=source)
+        return {
+            "queued": queued,
+            "failed": len([item for item in immediate_results if item.status == "failed"]),
+            "skipped": len([item for item in immediate_results if item.status == "skipped"]),
+        }
+
+    def __enqueue_paths(self, paths: List[Path], source: str) -> int:
+        paths = self.__deduplicate_paths(paths)
+        if not paths:
+            return 0
+        self.__ensure_worker()
+        run_id = f"{source}-{int(datetime.now().timestamp() * 1000)}"
+        self._run_states[run_id] = {
+            "run_id": run_id,
+            "source": source,
+            "total": len(paths),
+            "completed": 0,
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+            "current_file": paths[0].as_posix(),
+            "stage": "排队中",
+            "running": False,
+            "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        queued = 0
+        with self._queue_lock:
+            for path in paths:
+                if self.__is_path_already_queued(path):
+                    continue
+                task = QueueTask(
+                    task_id=f"{run_id}-{queued + 1}",
+                    file_path=str(path),
+                    source=source,
+                    run_id=run_id,
+                )
+                self._task_queue.put(task)
+                queued += 1
+        self._run_states[run_id]["total"] = queued
+        if queued == 0:
+            self._run_states[run_id]["stage"] = "无新任务"
+        logger.info(f"已加入处理队列：{queued} 个文件，来源：{source}")
+        return queued
+
+    def __is_path_already_queued(self, path: Path) -> bool:
+        current = self._current_task.file_path if self._current_task else None
+        if current and str(path) == current:
+            return True
+        if not self._task_queue:
+            return False
+        with self._task_queue.mutex:
+            for task in list(self._task_queue.queue):
+                if task and getattr(task, "file_path", None) == str(path):
+                    return True
+        return False
+
+    def __update_run_state(self, run_id: str, **kwargs):
+        state = self._run_states.get(run_id) or {}
+        state.update(kwargs)
+        state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._run_states[run_id] = state
+
+    def __advance_run_state(self, run_id: str, result: ProcessResult):
+        state = self._run_states.get(run_id)
+        if not state:
+            return
+        state["completed"] = int(state.get("completed", 0)) + 1
+        state[result.status] = int(state.get(result.status, 0)) + 1
+        state["current_file"] = result.file_path
+        state["stage"] = f"{result.status}:{result.mode}"
+        state["running"] = state["completed"] < state.get("total", 0)
+        if not state["running"]:
+            state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.__update_run_state(run_id, **state)
 
     def __expand_custom_path(self, path: Path) -> List[Path]:
         if not path.exists():
@@ -1448,12 +1686,31 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         translations: List[str] = []
         for start in range(0, len(english_cues), self._translate_batch_size):
             batch = english_cues[start:start + self._translate_batch_size]
-            translations.extend(self.__translate_batch(batch))
+            try:
+                batch_translations = self.__translate_batch(batch)
+                self.__validate_translations(batch, batch_translations)
+                translations.extend(batch_translations)
+            except Exception as err:
+                logger.warning(f"批量翻译结果异常，降级逐条翻译：{str(err)}")
+                for cue in batch:
+                    translations.append(self.__translate_single_cue(cue))
         if len(translations) != len(english_cues):
             raise RuntimeError("翻译结果数量与英文字幕条数不一致")
         return translations
 
-    def __translate_batch(self, cues: List[SubtitleCue]) -> List[str]:
+    def __translate_single_cue(self, cue: SubtitleCue) -> str:
+        last_error = None
+        for attempt in range(3):
+            try:
+                translated = self.__translate_batch([cue], strict_mode=True)[0]
+                self.__validate_translations([cue], [translated])
+                return translated
+            except Exception as err:
+                last_error = str(err)
+                logger.warning(f"单条翻译重试 {attempt + 1}/3 失败：{cue.text[:60]} -> {last_error}")
+        raise RuntimeError(f"字幕翻译失败：{last_error or '未知错误'}")
+
+    def __translate_batch(self, cues: List[SubtitleCue], strict_mode: bool = False) -> List[str]:
         endpoint = self.__build_translate_endpoint(self._translate_url)
         prompt_lines = [
             f"{cue.index}\t{cue.text.replace(chr(10), ' / ')}"
@@ -1469,6 +1726,8 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                         "你是专业影视字幕译者。"
                         "请将输入的英文字幕逐条翻译成简体中文。"
                         "必须保持顺序与数量一一对应，不要省略，不要增加解释。"
+                        "禁止直接原样返回英文原文。"
+                        "如果原文是音乐、音效、环境声提示，也要翻译成自然中文。"
                         "优先输出每行一条，严格使用“索引<TAB>译文”格式，例如“1\t你好”。"
                         "如果模型支持结构化输出，也可以返回 JSON 数组，格式为"
                         "[{\"index\":1,\"translation\":\"...\"}]。"
@@ -1477,7 +1736,11 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 {
                     "role": "user",
                     "content": (
-                        "请把下面内容翻译成简体中文，保持索引不变，只返回翻译结果：\n"
+                        (
+                            "请把下面内容翻译成简体中文，保持索引不变，只返回翻译结果：\n"
+                            if not strict_mode else
+                            "严格翻译成简体中文，不能保留英文原文；保持索引不变，只返回翻译结果：\n"
+                        )
                         + "\n".join(prompt_lines)
                     ),
                 },
@@ -1508,6 +1771,29 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         if not message:
             raise RuntimeError("翻译接口未返回有效内容")
         return self.__parse_translate_output(message=message, cues=cues)
+
+    def __validate_translations(self, cues: List[SubtitleCue], translations: List[str]) -> None:
+        if len(cues) != len(translations):
+            raise RuntimeError("翻译结果数量与原文数量不一致")
+        for cue, translated in zip(cues, translations):
+            if self.__looks_untranslated(cue.text, translated):
+                raise RuntimeError(f"疑似未翻译成功：{cue.text[:50]}")
+
+    @staticmethod
+    def __looks_untranslated(source: str, translated: str) -> bool:
+        source_cmp = _compare_text(source)
+        translated_cmp = _compare_text(translated)
+        if not translated_cmp:
+            return True
+        if source_cmp == translated_cmp:
+            return True
+        if _contains_cjk(translated):
+            return False
+        if not re.search(r"[A-Za-z]", source or ""):
+            return False
+        similarity = SequenceMatcher(None, source_cmp, translated_cmp).ratio()
+        ascii_only = bool(re.fullmatch(r"[\s\[\]\(\)\{\}A-Za-z0-9,.'!?;:;\"/\-]+", translated or ""))
+        return similarity >= 0.72 or ascii_only
 
     @staticmethod
     def __build_translate_endpoint(base_url: str) -> str:

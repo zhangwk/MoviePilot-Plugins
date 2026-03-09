@@ -303,7 +303,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.3"
+    plugin_version = "1.3.4"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -2165,20 +2165,28 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         hints = ENGLISH_HINTS if target == "english" else CHINESE_HINTS
         score = 0
         detected = (language_map or {}).get(stream.index)
+        has_target_evidence = False
 
         if detected:
             if detected == target:
                 score += 240
+                has_target_evidence = True
             else:
                 return -1000
 
         if language in hints:
             score += 120
+            has_target_evidence = True
         elif any(token in language for token in hints):
             score += 80
+            has_target_evidence = True
 
         if any(token in title for token in hints):
             score += 50
+            has_target_evidence = True
+
+        if not has_target_evidence:
+            return 0
 
         if stream.is_text:
             score += 20

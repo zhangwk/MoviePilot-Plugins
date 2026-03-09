@@ -1,5 +1,6 @@
 import queue
 import json
+import os
 import re
 import subprocess
 import threading
@@ -63,6 +64,16 @@ DEFAULT_SILICONFLOW_URL = "https://api.siliconflow.cn/v1"
 DEFAULT_TEST_TEXT = "We need to leave before sunrise, or we will miss the last train."
 FFPROBE_TIMEOUT_SECONDS = 90
 FFMPEG_EXTRACT_TIMEOUT_SECONDS = 300
+AUDIO_EXTRACT_TIMEOUT_SECONDS = 900
+
+WHISPER_MODEL_OPTIONS = [
+    {"title": "tiny", "value": "tiny"},
+    {"title": "base", "value": "base"},
+    {"title": "small", "value": "small"},
+    {"title": "medium", "value": "medium"},
+    {"title": "large-v3", "value": "large-v3"},
+    {"title": "large-v3-turbo", "value": "deepdml/faster-whisper-large-v3-turbo-ct2"},
+]
 
 
 @dataclass
@@ -96,6 +107,15 @@ class ProcessResult:
     output_path: str = ""
     english_stream: str = ""
     chinese_stream: str = ""
+
+
+@dataclass
+class AudioStream:
+    index: int
+    codec_name: str
+    language: str
+    title: str
+    is_default: bool
 
 
 @dataclass
@@ -277,7 +297,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.2.3"
+    plugin_version = "1.3.0"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -298,6 +318,10 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     _output_suffix = "zh.default"
     _ffmpeg_path = "ffmpeg"
     _ffprobe_path = "ffprobe"
+    _enable_asr_fallback = False
+    _whisper_model = "base"
+    _whisper_model_path = None
+    _whisper_use_proxy = True
     _translate_url = DEFAULT_SILICONFLOW_URL
     _translate_api_key = ""
     _translate_model = ""
@@ -328,6 +352,12 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             self._output_suffix = (config.get("output_suffix") or "zh.default").strip().strip(".")
             self._ffmpeg_path = (config.get("ffmpeg_path") or "ffmpeg").strip()
             self._ffprobe_path = (config.get("ffprobe_path") or "ffprobe").strip()
+            self._enable_asr_fallback = bool(config.get("enable_asr_fallback"))
+            self._whisper_model = (config.get("whisper_model") or "base").strip()
+            self._whisper_model_path = Path(
+                config.get("whisper_model_path") or (self.get_data_path() / "faster-whisper-models")
+            )
+            self._whisper_use_proxy = bool(config.get("whisper_use_proxy", True))
             self._translate_url = (config.get("translate_url") or DEFAULT_SILICONFLOW_URL).strip()
             self._translate_api_key = (config.get("translate_api_key") or "").strip()
             self._translate_model = (config.get("translate_model") or "").strip()
@@ -335,6 +365,8 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             self._translate_timeout = max(30, min(int(config.get("translate_timeout") or 180), 600))
             self._test_onlyonce = bool(config.get("test_onlyonce"))
             self._test_text = (config.get("test_text") or DEFAULT_TEST_TEXT).strip()
+        else:
+            self._whisper_model_path = self.get_data_path() / "faster-whisper-models"
 
         self.stop_service()
         self._event.clear()
@@ -476,6 +508,70 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                                     }
                                 ],
                             },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "enable_asr_fallback",
+                                            "label": "无字幕时启用音轨识别",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "whisper_model",
+                                            "label": "Whisper 模型",
+                                            "items": WHISPER_MODEL_OPTIONS,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "whisper_use_proxy",
+                                            "label": "下载模型时使用代理",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "whisper_model_path",
+                                            "label": "Whisper 模型目录",
+                                            "placeholder": "默认插件数据目录/faster-whisper-models",
+                                        },
+                                    }
+                                ],
+                            }
                         ],
                     },
                     {
@@ -737,7 +833,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "默认按硅基流动 OpenAI 兼容接口工作。模型名可自定义；保存配置后可通过“测试翻译一次”、命令 /embsub_test_translate 或插件页面按钮验证翻译接口。",
+                                            "text": "默认按硅基流动 OpenAI 兼容接口工作。若没有可用字幕，可启用 faster-whisper 从英文音轨生成英文字幕，再翻译成中英双语字幕。",
                                         },
                                     }
                                 ],
@@ -761,6 +857,10 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             "output_suffix": "zh.default",
             "ffmpeg_path": "ffmpeg",
             "ffprobe_path": "ffprobe",
+            "enable_asr_fallback": False,
+            "whisper_model": "base",
+            "whisper_model_path": "",
+            "whisper_use_proxy": True,
             "translate_url": DEFAULT_SILICONFLOW_URL,
             "translate_api_key": "",
             "translate_model": "",
@@ -1434,14 +1534,31 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         try:
             self.__update_task_stage("读取字幕流元数据", current_file=file_path)
             streams = self.__probe_subtitle_streams(file_path)
-            if not streams:
-                return ProcessResult(file_path=str(file_path), status="failed", mode="probe", reason="未找到任何内嵌字幕流")
-
             text_streams = [stream for stream in streams if stream.is_text]
-            self.__update_task_stage("识别字幕流语言", current_file=file_path, detail=f"{len(text_streams)} 条文本流")
-            language_map = self.__inspect_stream_languages(file_path, text_streams)
+            language_map = {}
+            if text_streams:
+                self.__update_task_stage("识别字幕流语言", current_file=file_path, detail=f"{len(text_streams)} 条文本流")
+                language_map = self.__inspect_stream_languages(file_path, text_streams)
 
             english_stream = self.__select_stream(streams, target="english", language_map=language_map)
+            chinese_stream = self.__select_stream(
+                streams,
+                target="chinese",
+                language_map=language_map,
+                exclude_indices={english_stream.index} if english_stream else None,
+            )
+
+            if not streams or (not english_stream and not chinese_stream):
+                if self._enable_asr_fallback:
+                    self.__update_task_stage("回退音轨识别", current_file=file_path)
+                    return self.__process_with_asr_fallback(file_path=file_path, output_path=output_path)
+                return ProcessResult(
+                    file_path=str(file_path),
+                    status="failed",
+                    mode="probe",
+                    reason="未找到可用字幕流，且未启用音轨识别回退",
+                )
+
             if not english_stream:
                 return ProcessResult(file_path=str(file_path), status="failed", mode="probe", reason="未找到英文字幕流")
             if not english_stream.is_text:
@@ -1453,12 +1570,6 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     english_stream=str(english_stream.index),
                 )
 
-            chinese_stream = self.__select_stream(
-                streams,
-                target="chinese",
-                language_map=language_map,
-                exclude_indices={english_stream.index},
-            )
             chinese_text_stream = chinese_stream if chinese_stream and chinese_stream.is_text else None
 
             self.__update_task_stage("抽取英文字幕", current_file=file_path, detail=f"stream {english_stream.index}")
@@ -1617,6 +1728,152 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             )
         return streams
 
+    def __probe_audio_streams(self, file_path: Path) -> List[AudioStream]:
+        try:
+            command = [
+                self._ffprobe_path or "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-select_streams",
+                "a",
+                str(file_path),
+            ]
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=FFPROBE_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(f"ffprobe 不可用：{self._ffprobe_path}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"音轨探测超时（>{FFPROBE_TIMEOUT_SECONDS}s）")
+        except Exception as err:
+            raise RuntimeError(f"执行 ffprobe 失败：{str(err)}")
+
+        if completed.returncode != 0:
+            error_message = completed.stderr.strip() or completed.stdout.strip() or "未知错误"
+            raise RuntimeError(f"音轨探测失败：{error_message}")
+
+        data = json.loads(completed.stdout or "{}")
+        streams: List[AudioStream] = []
+        for item in data.get("streams") or []:
+            tags = item.get("tags") or {}
+            disposition = item.get("disposition") or {}
+            streams.append(
+                AudioStream(
+                    index=int(item.get("index")),
+                    codec_name=(item.get("codec_name") or "").lower(),
+                    language=(tags.get("language") or "").strip().lower(),
+                    title=(tags.get("title") or "").strip(),
+                    is_default=bool(disposition.get("default")),
+                )
+            )
+        return streams
+
+    def __select_audio_stream(self, streams: List[AudioStream]) -> Optional[AudioStream]:
+        candidates: List[Tuple[int, AudioStream]] = []
+        for stream in streams:
+            language = (stream.language or "").lower()
+            title = (stream.title or "").lower()
+            score = 0
+            if language in ENGLISH_HINTS:
+                score += 200
+            elif any(token in language for token in ENGLISH_HINTS):
+                score += 120
+            if any(token in title for token in ENGLISH_HINTS):
+                score += 80
+            if stream.is_default:
+                score += 20
+            if len(streams) == 1:
+                score += 10
+            candidates.append((score, stream))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_stream = candidates[0]
+        if best_score <= 0:
+            return None
+        return best_stream
+
+    def __process_with_asr_fallback(self, file_path: Path, output_path: Path) -> ProcessResult:
+        if not self._enable_asr_fallback:
+            return ProcessResult(
+                file_path=str(file_path),
+                status="failed",
+                mode="asr",
+                reason="未启用音轨识别回退",
+            )
+
+        audio_streams = self.__probe_audio_streams(file_path)
+        if not audio_streams:
+            return ProcessResult(
+                file_path=str(file_path),
+                status="failed",
+                mode="asr",
+                reason="未找到音轨，无法进行音轨识别",
+            )
+        audio_stream = self.__select_audio_stream(audio_streams)
+        if not audio_stream:
+            return ProcessResult(
+                file_path=str(file_path),
+                status="failed",
+                mode="asr",
+                reason="未找到英文音轨，无法进行音轨识别",
+            )
+
+        temp_dir = Path(settings.TEMP_PATH) / "embeddedbilingualsubtitle" / "asr"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_prefix = f"{file_path.stem}_{int(datetime.now().timestamp())}_{threading.get_ident()}"
+        wav_path = temp_dir / f"{temp_prefix}.wav"
+        english_srt = temp_dir / f"{temp_prefix}.eng.srt"
+        try:
+            self.__update_task_stage("抽取英文音轨", current_file=file_path, detail=f"stream {audio_stream.index}")
+            self.__extract_audio_to_wav(file_path=file_path, stream=audio_stream, output_path=wav_path)
+            self.__update_task_stage("Whisper 识别英文音轨", current_file=file_path, detail=self._whisper_model)
+            english_cues = self.__transcribe_audio_to_cues(wav_path)
+            if not english_cues:
+                return ProcessResult(
+                    file_path=str(file_path),
+                    status="failed",
+                    mode="asr",
+                    reason="音轨识别未生成任何字幕",
+                )
+            _write_srt_file(english_srt, english_cues)
+            self.__update_task_stage("翻译英文字幕", current_file=file_path, detail=f"{len(english_cues)} 条")
+            chinese_lines = self.__translate_cues(english_cues)
+            bilingual_cues = [
+                SubtitleCue(
+                    index=cue.index,
+                    start_ms=cue.start_ms,
+                    end_ms=cue.end_ms,
+                    text=f"{cue.text}\n{translated}".strip(),
+                )
+                for cue, translated in zip(english_cues, chinese_lines)
+            ]
+            self.__update_task_stage("写出字幕文件", current_file=file_path, detail=output_path.name)
+            _write_srt_file(output_path, bilingual_cues)
+            return ProcessResult(
+                file_path=str(file_path),
+                status="success",
+                mode="asr_translate",
+                reason="无可用字幕流，已回退到英文音轨识别并生成中英双语字幕",
+                output_path=str(output_path),
+                english_stream=str(audio_stream.index),
+            )
+        finally:
+            if not self._keep_temp:
+                for temp_file in [wav_path, english_srt]:
+                    try:
+                        if temp_file.exists():
+                            temp_file.unlink()
+                    except Exception:
+                        pass
+
     def __inspect_stream_languages(self, file_path: Path, streams: List[SubtitleStream]) -> Dict[int, str]:
         language_map: Dict[int, str] = {}
         if not streams:
@@ -1773,6 +2030,99 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         if completed.returncode != 0 or not output_path.exists():
             message = completed.stderr.strip() or completed.stdout.strip() or "未知错误"
             raise RuntimeError(f"字幕流 {stream.index} 抽取失败：{message.splitlines()[-1]}")
+
+    def __extract_audio_to_wav(self, file_path: Path, stream: AudioStream, output_path: Path) -> None:
+        try:
+            command = [
+                self._ffmpeg_path or "ffmpeg",
+                "-y",
+                "-i",
+                str(file_path),
+                "-map",
+                f"0:{stream.index}",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(output_path),
+            ]
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=AUDIO_EXTRACT_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(f"ffmpeg 不可用：{self._ffmpeg_path}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"音频抽取超时（>{AUDIO_EXTRACT_TIMEOUT_SECONDS}s）")
+        except Exception as err:
+            raise RuntimeError(f"执行 ffmpeg 失败：{str(err)}")
+
+        if completed.returncode != 0 or not output_path.exists():
+            message = completed.stderr.strip() or completed.stdout.strip() or "未知错误"
+            raise RuntimeError(f"音频抽取失败：{message.splitlines()[-1]}")
+
+    def __transcribe_audio_to_cues(self, audio_file: Path) -> List[SubtitleCue]:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise RuntimeError("未安装 faster-whisper，请在插件依赖中安装后再启用音轨识别")
+
+        if not self._whisper_model_path:
+            self._whisper_model_path = self.get_data_path() / "faster-whisper-models"
+        self._whisper_model_path.mkdir(parents=True, exist_ok=True)
+
+        if self._whisper_use_proxy and settings.PROXY:
+            if settings.PROXY.get("http"):
+                os.environ["HTTP_PROXY"] = settings.PROXY["http"]
+            if settings.PROXY.get("https"):
+                os.environ["HTTPS_PROXY"] = settings.PROXY["https"]
+
+        try:
+            model = WhisperModel(
+                self._whisper_model,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=max(1, (os.cpu_count() or 2) // 2),
+                download_root=str(self._whisper_model_path),
+            )
+            segments, info = model.transcribe(
+                str(audio_file),
+                language="en",
+                vad_filter=True,
+                temperature=0,
+                beam_size=5,
+            )
+        except Exception as err:
+            raise RuntimeError(f"Whisper 音轨识别失败：{str(err)}")
+
+        detected_language = (getattr(info, "language", "") or "").lower()
+        if detected_language and not detected_language.startswith("en"):
+            raise RuntimeError(f"音轨识别语言不是英文：{detected_language}")
+
+        cues: List[SubtitleCue] = []
+        for segment in segments:
+            text = _normalize_text(getattr(segment, "text", "") or "")
+            if not text:
+                continue
+            start_ms = int(float(getattr(segment, "start", 0)) * 1000)
+            end_ms = int(float(getattr(segment, "end", 0)) * 1000)
+            if end_ms <= start_ms:
+                end_ms = start_ms + 1000
+            cues.append(
+                SubtitleCue(
+                    index=len(cues) + 1,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    text=text,
+                )
+            )
+        return cues
 
     def __translation_ready(self) -> bool:
         return self.__translation_config_error() is None
@@ -2156,6 +2506,10 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "output_suffix": self._output_suffix,
                 "ffmpeg_path": self._ffmpeg_path,
                 "ffprobe_path": self._ffprobe_path,
+                "enable_asr_fallback": self._enable_asr_fallback,
+                "whisper_model": self._whisper_model,
+                "whisper_model_path": str(self._whisper_model_path or ""),
+                "whisper_use_proxy": self._whisper_use_proxy,
                 "translate_url": self._translate_url,
                 "translate_api_key": self._translate_api_key,
                 "translate_model": self._translate_model,

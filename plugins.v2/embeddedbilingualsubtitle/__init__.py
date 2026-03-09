@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event as ThreadEvent
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -249,7 +249,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -876,8 +876,22 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         custom_files = [line.strip() for line in self._custom_files.splitlines() if line.strip()]
         if custom_files:
             logger.info(f"内嵌双语字幕合成开始处理自定义文件，共 {len(custom_files)} 个")
-            for file_name in custom_files:
-                results.append(self.__process_single_path(Path(file_name), source=source))
+            expanded_paths: List[Path] = []
+            for path_text in custom_files:
+                expanded_paths.extend(self.__expand_custom_path(Path(path_text)))
+            expanded_paths = self.__deduplicate_paths(expanded_paths)
+            if not expanded_paths:
+                results.append(
+                    ProcessResult(
+                        file_path="\n".join(custom_files),
+                        status="failed",
+                        mode="scan",
+                        reason="自定义路径下未找到可处理的视频文件",
+                    )
+                )
+            else:
+                for file_path in expanded_paths:
+                    results.append(self.__process_single_path(file_path, source=source))
             self.__notify_batch_summary(results, source=source)
             return results
 
@@ -906,6 +920,38 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         self.__notify_batch_summary(results, source=source)
         return results
 
+    def __expand_custom_path(self, path: Path) -> List[Path]:
+        if not path.exists():
+            logger.warn(f"自定义路径不存在：{path}")
+            return []
+        if path.is_file():
+            return [path]
+        if path.is_dir():
+            bluray_main = self.__resolve_bluray_main_video(path)
+            if bluray_main:
+                logger.info(f"检测到蓝光原盘目录，主视频定位为：{bluray_main}")
+                return [bluray_main]
+            media_files = list(SystemUtils.list_files(path, extensions=settings.RMT_MEDIAEXT))
+            if not media_files:
+                logger.warn(f"自定义目录下未找到媒体文件：{path}")
+            else:
+                logger.info(f"自定义目录 {path} 下找到 {len(media_files)} 个媒体文件")
+            return media_files
+        logger.warn(f"自定义路径不是文件也不是目录：{path}")
+        return []
+
+    @staticmethod
+    def __deduplicate_paths(paths: List[Path]) -> List[Path]:
+        unique_paths: List[Path] = []
+        seen = set()
+        for path in sorted(paths, key=lambda item: str(item)):
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_paths.append(path)
+        return unique_paths
+
     def __is_excluded(self, file_path: Path, exclude_paths: List[Path]) -> bool:
         for exclude_path in exclude_paths:
             try:
@@ -920,7 +966,11 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         logger.info(f"开始处理内嵌字幕：{file_path}")
         try:
             with ffmpeg_lock:
-                result = self.__do_process_single_path(file_path=file_path)
+                resolved = self.__normalize_media_input(file_path)
+                if isinstance(resolved, ProcessResult):
+                    result = resolved
+                else:
+                    result = self.__do_process_single_path(file_path=resolved)
         except Exception as err:
             result = ProcessResult(
                 file_path=str(file_path),
@@ -937,6 +987,55 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         else:
             logger.info(f"双语字幕跳过：{result.file_path}，原因：{result.reason}")
         return result
+
+    def __normalize_media_input(self, file_path: Path) -> Union[Path, ProcessResult]:
+        if file_path.is_dir():
+            bluray_main = self.__resolve_bluray_main_video(file_path)
+            if bluray_main:
+                logger.info(f"目录 {file_path} 识别为蓝光原盘，改为处理主视频 {bluray_main}")
+                return bluray_main
+            return ProcessResult(
+                file_path=str(file_path),
+                status="skipped",
+                mode="check",
+                reason="目录不是单个视频文件；如为蓝光原盘，请确保目录结构完整",
+            )
+
+        bluray_root = self.__find_bluray_root(file_path)
+        if bluray_root:
+            bluray_main = self.__resolve_bluray_main_video(bluray_root)
+            if bluray_main and bluray_main != file_path:
+                return ProcessResult(
+                    file_path=str(file_path),
+                    status="skipped",
+                    mode="check",
+                    reason=f"蓝光原盘已由主视频流处理：{bluray_main.name}",
+                )
+        return file_path
+
+    @staticmethod
+    def __find_bluray_root(file_path: Path) -> Optional[Path]:
+        parts = list(file_path.parts)
+        upper_parts = [part.upper() for part in parts]
+        if "BDMV" not in upper_parts:
+            return None
+        bdmv_index = upper_parts.index("BDMV")
+        if bdmv_index == 0:
+            return None
+        return Path(*parts[:bdmv_index])
+
+    def __resolve_bluray_main_video(self, path: Path) -> Optional[Path]:
+        bluray_root = path if path.is_dir() and SystemUtils.is_bluray_dir(path) else self.__find_bluray_root(path)
+        if not bluray_root:
+            return None
+        stream_dir = bluray_root / "BDMV" / "STREAM"
+        if not stream_dir.exists():
+            return None
+        candidates = list(SystemUtils.list_files(stream_dir, extensions=[".m2ts", ".mts", ".ssif"]))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item.stat().st_size if item.exists() else 0, reverse=True)
+        return candidates[0]
 
     def __do_process_single_path(self, file_path: Path) -> ProcessResult:
         if not file_path.exists():

@@ -55,6 +55,25 @@ CHINESE_HINTS = {
     "繁中",
     "繁体",
 }
+SIMPLIFIED_CHINESE_HINTS = {
+    "zh-cn",
+    "zh-hans",
+    "chs",
+    "gb",
+    "gbk",
+    "simplified",
+    "简中",
+    "简体",
+}
+TRADITIONAL_CHINESE_HINTS = {
+    "zh-hant",
+    "cht",
+    "big5",
+    "traditional",
+    "繁中",
+    "繁体",
+}
+GENERIC_LANGUAGE_HINTS = {"", "und", "unk", "unknown", "mul", "zxx", "mis"}
 ENGLISH_COMMON_WORDS = {
     "the", "and", "you", "are", "for", "that", "with", "this", "have",
     "what", "not", "your", "from", "they", "will", "just", "about",
@@ -308,7 +327,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.5"
+    plugin_version = "1.3.6"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -2206,6 +2225,11 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     f"{file_path} 字幕流语言命中元数据：stream {stream.index} -> {metadata_target}"
                 )
                 continue
+            if self.__has_explicit_non_target_metadata(stream):
+                logger.info(
+                    f"{file_path} 字幕流元数据已明确为其他语言，跳过抽样：stream {stream.index} lang={stream.language or '-'} title={stream.title or '-'}"
+                )
+                continue
             unresolved_streams.append(stream)
 
         sample_streams = unresolved_streams[:SUBTITLE_SAMPLE_STREAM_LIMIT]
@@ -2298,6 +2322,19 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         return None
 
     @staticmethod
+    def __has_explicit_non_target_metadata(stream: SubtitleStream) -> bool:
+        language = (stream.language or "").strip().lower()
+        if language and language not in GENERIC_LANGUAGE_HINTS:
+            return True
+        title = (stream.title or "").strip().lower()
+        if title and not any(
+            token in title
+            for token in ENGLISH_HINTS.union(CHINESE_HINTS)
+        ):
+            return True
+        return False
+
+    @staticmethod
     def __detect_target_from_text(text: str) -> Optional[str]:
         text = _normalize_text(text)
         if not text:
@@ -2384,8 +2421,21 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             score += 20
         if stream.is_forced:
             score -= 15
+        if target == "chinese":
+            score += self.__score_chinese_variant(stream)
 
         return score
+
+    @staticmethod
+    def __score_chinese_variant(stream: SubtitleStream) -> int:
+        language = (stream.language or "").lower()
+        title = (stream.title or "").lower()
+        combined = f"{language} {title}"
+        if any(token in combined for token in SIMPLIFIED_CHINESE_HINTS):
+            return 40
+        if any(token in combined for token in TRADITIONAL_CHINESE_HINTS):
+            return 10
+        return 0
 
     def __extract_stream_to_srt(
         self,

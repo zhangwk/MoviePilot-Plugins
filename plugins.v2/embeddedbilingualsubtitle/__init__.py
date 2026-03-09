@@ -327,7 +327,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.6"
+    plugin_version = "1.3.7"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -2437,6 +2437,11 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             return 10
         return 0
 
+    @staticmethod
+    def __is_missing_whisper_vad_asset(error_text: str) -> bool:
+        text = (error_text or "").lower()
+        return "silero_vad.onnx" in text or ("vad" in text and "no_suchfile" in text)
+
     def __extract_stream_to_srt(
         self,
         file_path: Path,
@@ -2584,14 +2589,34 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 cpu_threads=max(1, (os.cpu_count() or 2) // 2),
                 download_root=str(self._whisper_model_path),
             )
-            segments, info = model.transcribe(
-                str(audio_file),
-                language="en",
-                vad_filter=True,
-                temperature=0,
-                beam_size=5,
+            use_vad_filter = True
+            try:
+                segments, info = model.transcribe(
+                    str(audio_file),
+                    language="en",
+                    vad_filter=use_vad_filter,
+                    temperature=0,
+                    beam_size=5,
+                )
+            except Exception as err:
+                err_text = str(err)
+                if self.__is_missing_whisper_vad_asset(err_text):
+                    logger.warn(
+                        f"{audio_file} Whisper VAD 资源缺失，自动关闭 vad_filter 重试：{err_text}"
+                    )
+                    use_vad_filter = False
+                    segments, info = model.transcribe(
+                        str(audio_file),
+                        language="en",
+                        vad_filter=use_vad_filter,
+                        temperature=0,
+                        beam_size=5,
+                    )
+                else:
+                    raise
+            logger.info(
+                f"{audio_file} Whisper 已启动，等待识别结果输出，vad_filter={'on' if use_vad_filter else 'off'}"
             )
-            logger.info(f"{audio_file} Whisper 已启动，等待识别结果输出")
         except Exception as err:
             raise RuntimeError(f"Whisper 音轨识别失败：{str(err)}")
 

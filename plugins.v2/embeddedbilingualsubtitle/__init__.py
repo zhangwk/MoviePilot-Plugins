@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -65,6 +66,11 @@ DEFAULT_TEST_TEXT = "We need to leave before sunrise, or we will miss the last t
 FFPROBE_TIMEOUT_SECONDS = 90
 FFMPEG_EXTRACT_TIMEOUT_SECONDS = 300
 AUDIO_EXTRACT_TIMEOUT_SECONDS = 900
+SUBTITLE_SAMPLE_STREAM_LIMIT = 4
+SUBTITLE_SAMPLE_CONCURRENCY = 2
+SUBTITLE_SAMPLE_DURATION_SECONDS = 180
+SUBTITLE_SAMPLE_TIMEOUT_SECONDS = 35
+SUBTITLE_SAMPLE_CUE_LIMIT = 12
 
 WHISPER_MODEL_OPTIONS = [
     {"title": "tiny", "value": "tiny"},
@@ -297,9 +303,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.0"
-    plugin_author = "Codex"
-    author_url = "https://github.com/openai"
+    plugin_version = "1.3.1"
+    plugin_author = "zhangwk"
+    author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
     plugin_order = 35
     auth_level = 1
@@ -1878,8 +1884,6 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         language_map: Dict[int, str] = {}
         if not streams:
             return language_map
-        temp_dir = Path(settings.TEMP_PATH) / "embeddedbilingualsubtitle" / "detect"
-        temp_dir.mkdir(parents=True, exist_ok=True)
         unresolved_streams: List[SubtitleStream] = []
         for stream in streams[:8]:
             metadata_target = self.__detect_target_from_metadata(stream)
@@ -1888,34 +1892,71 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 continue
             unresolved_streams.append(stream)
 
-        for seq, stream in enumerate(unresolved_streams[:4], start=1):
-            self.__update_task_stage(
-                "抽样识别字幕流语言",
-                current_file=file_path,
-                detail=f"{seq}/{min(len(unresolved_streams), 4)}，stream {stream.index}",
-            )
-            sample_file = temp_dir / f"detect_{file_path.stem}_{stream.index}_{threading.get_ident()}.srt"
-            try:
-                self.__extract_stream_to_srt(
-                    file_path=file_path,
-                    stream=stream,
-                    output_path=sample_file,
-                    timeout=FFMPEG_EXTRACT_TIMEOUT_SECONDS,
+        sample_streams = unresolved_streams[:SUBTITLE_SAMPLE_STREAM_LIMIT]
+        if not sample_streams:
+            return language_map
+
+        max_workers = min(SUBTITLE_SAMPLE_CONCURRENCY, len(sample_streams))
+        self.__update_task_stage(
+            "抽样识别字幕流语言",
+            current_file=file_path,
+            detail=f"0/{len(sample_streams)}，{max_workers} 路并发",
+        )
+
+        detected_targets = set(language_map.values())
+        executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="embsub-detect")
+        future_map = {
+            executor.submit(self.__sample_stream_language, file_path, stream): stream
+            for stream in sample_streams
+        }
+        completed = 0
+        try:
+            for future in as_completed(future_map):
+                completed += 1
+                stream = future_map[future]
+                self.__update_task_stage(
+                    "抽样识别字幕流语言",
+                    current_file=file_path,
+                    detail=f"{completed}/{len(sample_streams)}，stream {stream.index}",
                 )
-                cues = _parse_srt_file(sample_file)[:12]
-                sample_text = "\n".join(cue.text for cue in cues)
-                detected = self.__detect_target_from_text(sample_text)
-                if detected:
-                    language_map[stream.index] = detected
-            except Exception as err:
-                logger.debug(f"字幕流语言探测失败，stream={stream.index}: {str(err)}")
-            finally:
                 try:
-                    if sample_file.exists():
-                        sample_file.unlink()
-                except Exception:
-                    pass
+                    detected = future.result()
+                    if detected:
+                        language_map[stream.index] = detected
+                        detected_targets.add(detected)
+                except Exception as err:
+                    logger.debug(f"字幕流语言探测失败，stream={stream.index}: {str(err)}")
+
+                if "english" in detected_targets and "chinese" in detected_targets:
+                    break
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         return language_map
+
+    def __sample_stream_language(self, file_path: Path, stream: SubtitleStream) -> Optional[str]:
+        temp_dir = Path(settings.TEMP_PATH) / "embeddedbilingualsubtitle" / "detect"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        sample_file = temp_dir / f"detect_{file_path.stem}_{stream.index}_{threading.get_ident()}.srt"
+        try:
+            self.__extract_stream_to_srt(
+                file_path=file_path,
+                stream=stream,
+                output_path=sample_file,
+                timeout=SUBTITLE_SAMPLE_TIMEOUT_SECONDS,
+                start_seconds=0,
+                duration_limit=SUBTITLE_SAMPLE_DURATION_SECONDS,
+            )
+            cues = _parse_srt_file(sample_file)[:SUBTITLE_SAMPLE_CUE_LIMIT]
+            if not cues:
+                return None
+            sample_text = "\n".join(cue.text for cue in cues)
+            return self.__detect_target_from_text(sample_text)
+        finally:
+            try:
+                if sample_file.exists():
+                    sample_file.unlink()
+            except Exception:
+                pass
 
     @staticmethod
     def __detect_target_from_metadata(stream: SubtitleStream) -> Optional[str]:
@@ -1998,11 +2039,23 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         stream: SubtitleStream,
         output_path: Path,
         timeout: int = FFMPEG_EXTRACT_TIMEOUT_SECONDS,
+        start_seconds: Optional[int] = None,
+        duration_limit: Optional[int] = None,
     ) -> None:
         try:
             command = [
                 self._ffmpeg_path or "ffmpeg",
                 "-y",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+            ]
+            if start_seconds is not None and start_seconds > 0:
+                command.extend(["-ss", str(start_seconds)])
+            if duration_limit is not None and duration_limit > 0:
+                command.extend(["-t", str(duration_limit)])
+            command.extend([
                 "-i",
                 str(file_path),
                 "-map",
@@ -2012,7 +2065,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "-c:s",
                 "srt",
                 str(output_path),
-            ]
+            ])
             completed = subprocess.run(
                 command,
                 capture_output=True,

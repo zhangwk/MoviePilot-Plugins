@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from dataclasses import dataclass
@@ -130,6 +131,10 @@ class QueueTask:
     file_path: str
     source: str
     run_id: str
+
+
+class TaskCancelledError(RuntimeError):
+    pass
 
 
 def _normalize_text(text: str) -> str:
@@ -303,7 +308,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.4"
+    plugin_version = "1.3.5"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -341,6 +346,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     _current_task = None
     _queue_lock = threading.Lock()
     _run_states = None
+    _cancel_event = ThreadEvent()
+    _active_process = None
+    _active_process_lock = threading.Lock()
 
     def init_plugin(self, config: dict = None):
         self._run_states = {}
@@ -376,6 +384,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
 
         self.stop_service()
         self._event.clear()
+        self._cancel_event.clear()
         self.__ensure_worker()
 
         if self._enabled or self._onlyonce or self._test_onlyonce:
@@ -435,6 +444,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "desc": "测试硅基流动翻译接口",
                 "category": "工具",
                 "data": {"action": "embsub_test_translate"},
+            },
+            {
+                "cmd": "/embsub_stop",
+                "event": EventType.PluginAction,
+                "desc": "停止当前内嵌字幕任务",
+                "category": "工具",
+                "data": {"action": "embsub_stop"},
             }
         ]
 
@@ -453,6 +469,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "methods": ["POST"],
                 "summary": "清空处理记录",
                 "description": "清空插件处理历史与最近一次测试结果",
+            },
+            {
+                "path": "/stop_tasks",
+                "endpoint": self._api_stop_tasks,
+                "methods": ["POST"],
+                "summary": "停止当前任务",
+                "description": "停止当前处理中的任务并清空等待队列",
             }
         ]
 
@@ -984,6 +1007,21 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                             }
                         },
                     },
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "prepend-icon": "mdi-stop-circle-outline",
+                            "variant": "text",
+                            "color": "error",
+                        },
+                        "text": "停止当前任务",
+                        "events": {
+                            "click": {
+                                "api": f"plugin/{self.__class__.__name__}/stop_tasks?apikey={settings.API_TOKEN}",
+                                "method": "post",
+                            }
+                        },
+                    },
                 ],
             },
             {
@@ -1138,6 +1176,14 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         logger.info("内嵌双语字幕合成历史记录已清空")
         return {"success": True}
 
+    def _api_stop_tasks(self) -> dict:
+        result = self.__request_stop_tasks(source="api")
+        return {
+            "success": True,
+            "message": result.get("reason") or "已发送停止请求",
+            "data": result,
+        }
+
     def __ensure_worker(self):
         if self._task_queue is None:
             self._task_queue = queue.Queue()
@@ -1146,9 +1192,49 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         self._worker_thread = threading.Thread(target=self.__consume_tasks, daemon=True)
         self._worker_thread.start()
 
+    def __request_stop_tasks(self, source: str) -> dict:
+        current_file = self._current_task.file_path if self._current_task else ""
+        cleared = 0
+        affected_runs: Dict[str, int] = {}
+        self._cancel_event.set()
+        with self._queue_lock:
+            if self._task_queue:
+                while not self._task_queue.empty():
+                    try:
+                        task = self._task_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if task:
+                        affected_runs[task.run_id] = affected_runs.get(task.run_id, 0) + 1
+                        cleared += 1
+                    self._task_queue.task_done()
+        for run_id, count in affected_runs.items():
+            self.__mark_run_tasks_skipped(run_id=run_id, count=count, stage="已手动停止")
+        if self._current_task:
+            self.__update_run_state(self._current_task.run_id, stage="停止中", running=True)
+        terminated = self.__terminate_active_process()
+        if not self._current_task:
+            self._cancel_event.clear()
+        reason = (
+            f"已请求停止当前任务，清空队列 {cleared} 个"
+            + ("，并终止当前 ffmpeg/ffprobe 进程" if terminated else "")
+        )
+        logger.warn(
+            f"内嵌双语字幕合成收到停止请求：current={current_file or '-'}，cleared={cleared}，terminated={terminated}，source={source}"
+        )
+        return {
+            "success": True,
+            "reason": reason,
+            "current_file": current_file,
+            "cleared": cleared,
+            "terminated": terminated,
+        }
+
     def stop_service(self):
         try:
             self._event.set()
+            self._cancel_event.set()
+            self.__terminate_active_process()
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
@@ -1184,6 +1270,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             self.__advance_run_state(task.run_id, result)
             self._current_task = None
             self._task_queue.task_done()
+            if self._cancel_event.is_set():
+                self._cancel_event.clear()
+                logger.info("内嵌双语字幕合成停止请求已处理完成")
 
     @eventmanager.register(EventType.PluginAction)
     def handle_command(self, event: Event = None):
@@ -1206,6 +1295,20 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 title=title,
                 userid=event_data.get("user"),
                 text=text,
+            )
+            return
+        if action == "embsub_stop":
+            result = self.__request_stop_tasks(source="command")
+            self.post_message(
+                channel=event_data.get("channel"),
+                title="内嵌双语字幕停止请求已发送",
+                userid=event_data.get("user"),
+                text=(
+                    f"当前任务：{result.get('current_file') or '-'}\n"
+                    f"清空队列：{result.get('cleared', 0)}\n"
+                    f"终止进程：{'是' if result.get('terminated') else '否'}\n"
+                    f"说明：{result.get('reason') or '-'}"
+                ),
             )
             return
         if action != "embsub_scan":
@@ -1379,6 +1482,85 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.__update_run_state(run_id, **state)
 
+    def __mark_run_tasks_skipped(self, run_id: str, count: int, stage: str):
+        if count <= 0:
+            return
+        state = self._run_states.get(run_id)
+        if not state:
+            return
+        state["completed"] = int(state.get("completed", 0)) + count
+        state["skipped"] = int(state.get("skipped", 0)) + count
+        state["stage"] = stage
+        state["running"] = state["completed"] < state.get("total", 0)
+        if not state["running"]:
+            state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.__update_run_state(run_id, **state)
+
+    def __terminate_active_process(self) -> bool:
+        with self._active_process_lock:
+            process = self._active_process
+        if not process or process.poll() is not None:
+            return False
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except Exception:
+                pass
+        finally:
+            with self._active_process_lock:
+                if self._active_process is process:
+                    self._active_process = None
+        return True
+
+    def __raise_if_cancelled(self, file_path: Optional[Path] = None):
+        if self._cancel_event.is_set():
+            logger.warn(f"{file_path or '-'} 收到停止请求，终止当前处理")
+            raise TaskCancelledError("任务已手动停止")
+
+    def __run_subprocess(self, command: List[str], timeout: int, file_path: Optional[Path] = None) -> subprocess.CompletedProcess:
+        self.__raise_if_cancelled(file_path)
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            raise
+        except Exception:
+            raise
+
+        with self._active_process_lock:
+            self._active_process = process
+
+        start_time = time.monotonic()
+        try:
+            while True:
+                self.__raise_if_cancelled(file_path)
+                remaining = timeout - (time.monotonic() - start_time)
+                if remaining <= 0:
+                    self.__terminate_active_process()
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except TaskCancelledError:
+            self.__terminate_active_process()
+            raise
+        finally:
+            with self._active_process_lock:
+                if self._active_process is process:
+                    self._active_process = None
+
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
     def __update_task_stage(
         self,
         stage: str,
@@ -1485,6 +1667,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         logger.info(f"开始处理内嵌字幕：{file_path}")
         try:
             with ffmpeg_lock:
+                self.__raise_if_cancelled(file_path)
                 self.__update_task_stage("解析输入", current_file=file_path)
                 resolved = self.__normalize_media_input(file_path)
                 if isinstance(resolved, ProcessResult):
@@ -1492,6 +1675,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 else:
                     self.__update_task_stage("处理媒体文件", current_file=resolved)
                     result = self.__do_process_single_path(file_path=resolved)
+        except TaskCancelledError as err:
+            result = ProcessResult(
+                file_path=str(file_path),
+                status="skipped",
+                mode="cancel",
+                reason=str(err),
+            )
         except Exception as err:
             result = ProcessResult(
                 file_path=str(file_path),
@@ -1559,6 +1749,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         return candidates[0]
 
     def __do_process_single_path(self, file_path: Path) -> ProcessResult:
+        self.__raise_if_cancelled(file_path)
         if not file_path.exists():
             return ProcessResult(file_path=str(file_path), status="failed", mode="check", reason="文件不存在")
         if file_path.suffix.lower() not in settings.RMT_MEDIAEXT:
@@ -1626,6 +1817,8 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 logger.info(
                     f"{file_path} 存在非文本中文字幕候选：{self.__describe_subtitle_stream(chinese_any_stream, language_map)}"
                 )
+            if not english_candidates:
+                logger.warn(f"{file_path} 未找到任何英文字幕证据，将直接进入英文缺失分支")
 
             if not streams or (not english_stream and not chinese_any_stream):
                 if self._enable_asr_fallback:
@@ -1801,17 +1994,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "s",
                 str(file_path),
             ]
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=FFPROBE_TIMEOUT_SECONDS,
-            )
+            completed = self.__run_subprocess(command=command, timeout=FFPROBE_TIMEOUT_SECONDS, file_path=file_path)
         except FileNotFoundError:
             raise RuntimeError(f"ffprobe 不可用：{self._ffprobe_path}")
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"ffprobe 超时（>{FFPROBE_TIMEOUT_SECONDS}s），请检查媒体文件或存储性能")
+        except TaskCancelledError:
+            raise
         except Exception as err:
             raise RuntimeError(f"执行 ffprobe 失败：{str(err)}")
 
@@ -1860,17 +2049,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "a",
                 str(file_path),
             ]
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=FFPROBE_TIMEOUT_SECONDS,
-            )
+            completed = self.__run_subprocess(command=command, timeout=FFPROBE_TIMEOUT_SECONDS, file_path=file_path)
         except FileNotFoundError:
             raise RuntimeError(f"ffprobe 不可用：{self._ffprobe_path}")
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"音轨探测超时（>{FFPROBE_TIMEOUT_SECONDS}s）")
+        except TaskCancelledError:
+            raise
         except Exception as err:
             raise RuntimeError(f"执行 ffprobe 失败：{str(err)}")
 
@@ -1927,6 +2112,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         return best_stream
 
     def __process_with_asr_fallback(self, file_path: Path, output_path: Path) -> ProcessResult:
+        self.__raise_if_cancelled(file_path)
         if not self._enable_asr_fallback:
             return ProcessResult(
                 file_path=str(file_path),
@@ -1963,6 +2149,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         try:
             self.__update_task_stage("抽取英文音轨", current_file=file_path, detail=f"stream {audio_stream.index}")
             self.__extract_audio_to_wav(file_path=file_path, stream=audio_stream, output_path=wav_path)
+            self.__raise_if_cancelled(file_path)
             self.__update_task_stage("Whisper 识别英文音轨", current_file=file_path, detail=self._whisper_model)
             english_cues = self.__transcribe_audio_to_cues(wav_path)
             if not english_cues:
@@ -1974,6 +2161,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 )
             logger.info(f"{file_path} Whisper 识别完成：生成英文字幕 {len(english_cues)} 条")
             _write_srt_file(english_srt, english_cues)
+            self.__raise_if_cancelled(file_path)
             self.__update_task_stage("翻译英文字幕", current_file=file_path, detail=f"{len(english_cues)} 条")
             chinese_lines = self.__translate_cues(english_cues)
             bilingual_cues = [
@@ -2006,6 +2194,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
 
     def __inspect_stream_languages(self, file_path: Path, streams: List[SubtitleStream]) -> Dict[int, str]:
         language_map: Dict[int, str] = {}
+        self.__raise_if_cancelled(file_path)
         if not streams:
             return language_map
         unresolved_streams: List[SubtitleStream] = []
@@ -2042,6 +2231,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         completed = 0
         try:
             for future in as_completed(future_map):
+                self.__raise_if_cancelled(file_path)
                 completed += 1
                 stream = future_map[future]
                 self.__update_task_stage(
@@ -2235,17 +2425,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "srt",
                 str(output_path),
             ])
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=timeout,
-            )
+            completed = self.__run_subprocess(command=command, timeout=timeout, file_path=file_path)
         except FileNotFoundError:
             raise RuntimeError(f"ffmpeg 不可用：{self._ffmpeg_path}")
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"字幕流 {stream.index} 抽取超时（>{timeout}s）")
+        except TaskCancelledError:
+            raise
         except Exception as err:
             raise RuntimeError(f"执行 ffmpeg 失败：{str(err)}")
 
@@ -2263,6 +2449,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     ) -> Tuple[Optional[SubtitleStream], List[SubtitleCue], str]:
         last_error = ""
         for attempt, stream in enumerate(candidates, start=1):
+            self.__raise_if_cancelled(file_path)
             self.__update_task_stage(
                 stage_name,
                 current_file=file_path,
@@ -2305,17 +2492,17 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "pcm_s16le",
                 str(output_path),
             ]
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
+            completed = self.__run_subprocess(
+                command=command,
                 timeout=AUDIO_EXTRACT_TIMEOUT_SECONDS,
+                file_path=file_path,
             )
         except FileNotFoundError:
             raise RuntimeError(f"ffmpeg 不可用：{self._ffmpeg_path}")
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"音频抽取超时（>{AUDIO_EXTRACT_TIMEOUT_SECONDS}s）")
+        except TaskCancelledError:
+            raise
         except Exception as err:
             raise RuntimeError(f"执行 ffmpeg 失败：{str(err)}")
 
@@ -2354,6 +2541,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 temperature=0,
                 beam_size=5,
             )
+            logger.info(f"{audio_file} Whisper 已启动，等待识别结果输出")
         except Exception as err:
             raise RuntimeError(f"Whisper 音轨识别失败：{str(err)}")
 
@@ -2363,6 +2551,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
 
         cues: List[SubtitleCue] = []
         for segment in segments:
+            self.__raise_if_cancelled(audio_file)
             text = _normalize_text(getattr(segment, "text", "") or "")
             if not text:
                 continue
@@ -2443,6 +2632,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             f"开始批量翻译字幕：共 {len(english_cues)} 条，批大小 {self._translate_batch_size}，批次数 {total_batches}，模型 {self._translate_model}"
         )
         for batch_index, start in enumerate(range(0, len(english_cues), self._translate_batch_size), start=1):
+            self.__raise_if_cancelled()
             batch = english_cues[start:start + self._translate_batch_size]
             self.__update_task_stage(
                 "翻译字幕批次",
@@ -2457,6 +2647,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             except Exception as err:
                 logger.warning(f"批量翻译结果异常，降级逐条翻译：{str(err)}")
                 for cue in batch:
+                    self.__raise_if_cancelled()
                     self.__update_task_stage(
                         "逐条重试翻译",
                         detail=f"{cue.index}/{len(english_cues)}",
@@ -2469,6 +2660,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     def __translate_single_cue(self, cue: SubtitleCue) -> str:
         last_error = None
         for attempt in range(3):
+            self.__raise_if_cancelled()
             try:
                 translated = self.__translate_batch([cue], strict_mode=True)[0]
                 self.__validate_translations([cue], [translated])
@@ -2479,6 +2671,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         raise RuntimeError(f"字幕翻译失败：{last_error or '未知错误'}")
 
     def __translate_batch(self, cues: List[SubtitleCue], strict_mode: bool = False) -> List[str]:
+        self.__raise_if_cancelled()
         endpoint = self.__build_translate_endpoint(self._translate_url)
         prompt_lines = [
             f"{cue.index}\t{cue.text.replace(chr(10), ' / ')}"

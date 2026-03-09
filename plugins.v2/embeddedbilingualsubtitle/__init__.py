@@ -270,7 +270,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -1266,6 +1266,23 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.__update_run_state(run_id, **state)
 
+    def __update_task_stage(
+        self,
+        stage: str,
+        current_file: Optional[Union[Path, str]] = None,
+        detail: Optional[str] = None,
+    ):
+        task = self._current_task
+        if not task:
+            return
+        text = stage if not detail else f"{stage} - {detail}"
+        self.__update_run_state(
+            task.run_id,
+            current_file=str(current_file or task.file_path),
+            stage=text,
+            running=True,
+        )
+
     def __expand_custom_path(self, path: Path) -> List[Path]:
         if not path.exists():
             logger.warn(f"自定义路径不存在：{path}")
@@ -1312,10 +1329,12 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         logger.info(f"开始处理内嵌字幕：{file_path}")
         try:
             with ffmpeg_lock:
+                self.__update_task_stage("解析输入", current_file=file_path)
                 resolved = self.__normalize_media_input(file_path)
                 if isinstance(resolved, ProcessResult):
                     result = resolved
                 else:
+                    self.__update_task_stage("处理媒体文件", current_file=resolved)
                     result = self.__do_process_single_path(file_path=resolved)
         except Exception as err:
             result = ProcessResult(
@@ -1406,6 +1425,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         chinese_srt = temp_dir / f"{temp_prefix}.chi.srt"
 
         try:
+            self.__update_task_stage("探测字幕流", current_file=file_path)
             streams = self.__probe_subtitle_streams(file_path)
             if not streams:
                 return ProcessResult(file_path=str(file_path), status="failed", mode="probe", reason="未找到任何内嵌字幕流")
@@ -1425,6 +1445,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             chinese_stream = self.__select_stream(streams, target="chinese")
             chinese_text_stream = chinese_stream if chinese_stream and chinese_stream.is_text else None
 
+            self.__update_task_stage("抽取英文字幕", current_file=file_path, detail=f"stream {english_stream.index}")
             self.__extract_stream_to_srt(file_path=file_path, stream=english_stream, output_path=english_srt)
             english_cues = _parse_srt_file(english_srt)
             if not english_cues:
@@ -1437,6 +1458,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 )
 
             if chinese_text_stream:
+                self.__update_task_stage("抽取中文字幕", current_file=file_path, detail=f"stream {chinese_text_stream.index}")
                 self.__extract_stream_to_srt(file_path=file_path, stream=chinese_text_stream, output_path=chinese_srt)
                 chinese_cues = _parse_srt_file(chinese_srt)
                 if not chinese_cues:
@@ -1448,6 +1470,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                         english_stream=str(english_stream.index),
                         chinese_stream=str(chinese_text_stream.index),
                     )
+                self.__update_task_stage("合并中英字幕", current_file=file_path, detail=f"{len(english_cues)} 条")
                 bilingual_cues, coverage = _build_bilingual_cues(english_cues, chinese_cues)
                 if coverage < 0.35:
                     return ProcessResult(
@@ -1458,6 +1481,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                         english_stream=str(english_stream.index),
                         chinese_stream=str(chinese_text_stream.index),
                     )
+                self.__update_task_stage("写出字幕文件", current_file=file_path, detail=output_path.name)
                 _write_srt_file(output_path, bilingual_cues)
                 return ProcessResult(
                     file_path=str(file_path),
@@ -1485,6 +1509,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     chinese_stream=str(chinese_stream.index) if chinese_stream else "",
                 )
 
+            self.__update_task_stage("翻译英文字幕", current_file=file_path, detail=f"{len(english_cues)} 条")
             chinese_lines = self.__translate_cues(english_cues)
             bilingual_cues = [
                 SubtitleCue(
@@ -1495,6 +1520,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 )
                 for cue, translated in zip(english_cues, chinese_lines)
             ]
+            self.__update_task_stage("写出字幕文件", current_file=file_path, detail=output_path.name)
             _write_srt_file(output_path, bilingual_cues)
             return ProcessResult(
                 file_path=str(file_path),
@@ -1684,8 +1710,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
 
     def __translate_cues(self, english_cues: List[SubtitleCue]) -> List[str]:
         translations: List[str] = []
-        for start in range(0, len(english_cues), self._translate_batch_size):
+        total_batches = max(1, (len(english_cues) + self._translate_batch_size - 1) // self._translate_batch_size)
+        for batch_index, start in enumerate(range(0, len(english_cues), self._translate_batch_size), start=1):
             batch = english_cues[start:start + self._translate_batch_size]
+            self.__update_task_stage(
+                "翻译字幕批次",
+                detail=f"{batch_index}/{total_batches}，本批 {len(batch)} 条",
+            )
             try:
                 batch_translations = self.__translate_batch(batch)
                 self.__validate_translations(batch, batch_translations)
@@ -1693,6 +1724,10 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             except Exception as err:
                 logger.warning(f"批量翻译结果异常，降级逐条翻译：{str(err)}")
                 for cue in batch:
+                    self.__update_task_stage(
+                        "逐条重试翻译",
+                        detail=f"{cue.index}/{len(english_cues)}",
+                    )
                     translations.append(self.__translate_single_cue(cue))
         if len(translations) != len(english_cues):
             raise RuntimeError("翻译结果数量与英文字幕条数不一致")

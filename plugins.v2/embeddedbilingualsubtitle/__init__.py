@@ -61,6 +61,8 @@ ENGLISH_COMMON_WORDS = {
 ffmpeg_lock = threading.Lock()
 DEFAULT_SILICONFLOW_URL = "https://api.siliconflow.cn/v1"
 DEFAULT_TEST_TEXT = "We need to leave before sunrise, or we will miss the last train."
+FFPROBE_TIMEOUT_SECONDS = 90
+FFMPEG_EXTRACT_TIMEOUT_SECONDS = 300
 
 
 @dataclass
@@ -275,7 +277,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -1430,12 +1432,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         chinese_srt = temp_dir / f"{temp_prefix}.chi.srt"
 
         try:
-            self.__update_task_stage("探测字幕流", current_file=file_path)
+            self.__update_task_stage("读取字幕流元数据", current_file=file_path)
             streams = self.__probe_subtitle_streams(file_path)
             if not streams:
                 return ProcessResult(file_path=str(file_path), status="failed", mode="probe", reason="未找到任何内嵌字幕流")
 
             text_streams = [stream for stream in streams if stream.is_text]
+            self.__update_task_stage("识别字幕流语言", current_file=file_path, detail=f"{len(text_streams)} 条文本流")
             language_map = self.__inspect_stream_languages(file_path, text_streams)
 
             english_stream = self.__select_stream(streams, target="english", language_map=language_map)
@@ -1575,9 +1578,17 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "s",
                 str(file_path),
             ]
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=FFPROBE_TIMEOUT_SECONDS,
+            )
         except FileNotFoundError:
             raise RuntimeError(f"ffprobe 不可用：{self._ffprobe_path}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"ffprobe 超时（>{FFPROBE_TIMEOUT_SECONDS}s），请检查媒体文件或存储性能")
         except Exception as err:
             raise RuntimeError(f"执行 ffprobe 失败：{str(err)}")
 
@@ -1612,14 +1623,28 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             return language_map
         temp_dir = Path(settings.TEMP_PATH) / "embeddedbilingualsubtitle" / "detect"
         temp_dir.mkdir(parents=True, exist_ok=True)
+        unresolved_streams: List[SubtitleStream] = []
         for stream in streams[:8]:
             metadata_target = self.__detect_target_from_metadata(stream)
             if metadata_target:
                 language_map[stream.index] = metadata_target
                 continue
+            unresolved_streams.append(stream)
+
+        for seq, stream in enumerate(unresolved_streams[:4], start=1):
+            self.__update_task_stage(
+                "抽样识别字幕流语言",
+                current_file=file_path,
+                detail=f"{seq}/{min(len(unresolved_streams), 4)}，stream {stream.index}",
+            )
             sample_file = temp_dir / f"detect_{file_path.stem}_{stream.index}_{threading.get_ident()}.srt"
             try:
-                self.__extract_stream_to_srt(file_path=file_path, stream=stream, output_path=sample_file)
+                self.__extract_stream_to_srt(
+                    file_path=file_path,
+                    stream=stream,
+                    output_path=sample_file,
+                    timeout=FFMPEG_EXTRACT_TIMEOUT_SECONDS,
+                )
                 cues = _parse_srt_file(sample_file)[:12]
                 sample_text = "\n".join(cue.text for cue in cues)
                 detected = self.__detect_target_from_text(sample_text)
@@ -1710,7 +1735,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
 
         return score
 
-    def __extract_stream_to_srt(self, file_path: Path, stream: SubtitleStream, output_path: Path) -> None:
+    def __extract_stream_to_srt(
+        self,
+        file_path: Path,
+        stream: SubtitleStream,
+        output_path: Path,
+        timeout: int = FFMPEG_EXTRACT_TIMEOUT_SECONDS,
+    ) -> None:
         try:
             command = [
                 self._ffmpeg_path or "ffmpeg",
@@ -1725,9 +1756,17 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "srt",
                 str(output_path),
             ]
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
         except FileNotFoundError:
             raise RuntimeError(f"ffmpeg 不可用：{self._ffmpeg_path}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"字幕流 {stream.index} 抽取超时（>{timeout}s）")
         except Exception as err:
             raise RuntimeError(f"执行 ffmpeg 失败：{str(err)}")
 

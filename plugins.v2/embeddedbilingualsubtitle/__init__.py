@@ -52,6 +52,11 @@ CHINESE_HINTS = {
     "繁中",
     "繁体",
 }
+ENGLISH_COMMON_WORDS = {
+    "the", "and", "you", "are", "for", "that", "with", "this", "have",
+    "what", "not", "your", "from", "they", "will", "just", "about",
+    "there", "would", "could", "should", "mind", "okay", "before",
+}
 
 ffmpeg_lock = threading.Lock()
 DEFAULT_SILICONFLOW_URL = "https://api.siliconflow.cn/v1"
@@ -270,7 +275,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -1430,7 +1435,10 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             if not streams:
                 return ProcessResult(file_path=str(file_path), status="failed", mode="probe", reason="未找到任何内嵌字幕流")
 
-            english_stream = self.__select_stream(streams, target="english")
+            text_streams = [stream for stream in streams if stream.is_text]
+            language_map = self.__inspect_stream_languages(file_path, text_streams)
+
+            english_stream = self.__select_stream(streams, target="english", language_map=language_map)
             if not english_stream:
                 return ProcessResult(file_path=str(file_path), status="failed", mode="probe", reason="未找到英文字幕流")
             if not english_stream.is_text:
@@ -1442,7 +1450,12 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     english_stream=str(english_stream.index),
                 )
 
-            chinese_stream = self.__select_stream(streams, target="chinese")
+            chinese_stream = self.__select_stream(
+                streams,
+                target="chinese",
+                language_map=language_map,
+                exclude_indices={english_stream.index},
+            )
             chinese_text_stream = chinese_stream if chinese_stream and chinese_stream.is_text else None
 
             self.__update_task_stage("抽取英文字幕", current_file=file_path, detail=f"stream {english_stream.index}")
@@ -1593,10 +1606,73 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             )
         return streams
 
-    def __select_stream(self, streams: List[SubtitleStream], target: str) -> Optional[SubtitleStream]:
+    def __inspect_stream_languages(self, file_path: Path, streams: List[SubtitleStream]) -> Dict[int, str]:
+        language_map: Dict[int, str] = {}
+        if not streams:
+            return language_map
+        temp_dir = Path(settings.TEMP_PATH) / "embeddedbilingualsubtitle" / "detect"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        for stream in streams[:8]:
+            metadata_target = self.__detect_target_from_metadata(stream)
+            if metadata_target:
+                language_map[stream.index] = metadata_target
+                continue
+            sample_file = temp_dir / f"detect_{file_path.stem}_{stream.index}_{threading.get_ident()}.srt"
+            try:
+                self.__extract_stream_to_srt(file_path=file_path, stream=stream, output_path=sample_file)
+                cues = _parse_srt_file(sample_file)[:12]
+                sample_text = "\n".join(cue.text for cue in cues)
+                detected = self.__detect_target_from_text(sample_text)
+                if detected:
+                    language_map[stream.index] = detected
+            except Exception as err:
+                logger.debug(f"字幕流语言探测失败，stream={stream.index}: {str(err)}")
+            finally:
+                try:
+                    if sample_file.exists():
+                        sample_file.unlink()
+                except Exception:
+                    pass
+        return language_map
+
+    @staticmethod
+    def __detect_target_from_metadata(stream: SubtitleStream) -> Optional[str]:
+        language = (stream.language or "").lower()
+        title = (stream.title or "").lower()
+        if language in ENGLISH_HINTS or any(token in title for token in ENGLISH_HINTS):
+            return "english"
+        if language in CHINESE_HINTS or any(token in title for token in CHINESE_HINTS):
+            return "chinese"
+        return None
+
+    @staticmethod
+    def __detect_target_from_text(text: str) -> Optional[str]:
+        text = _normalize_text(text)
+        if not text:
+            return None
+        cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+        latin_words = re.findall(r"[A-Za-z']+", text)
+        if cjk_count >= 6:
+            return "chinese"
+        if latin_words:
+            lowered = [word.lower() for word in latin_words]
+            common_hits = len([word for word in lowered if word in ENGLISH_COMMON_WORDS])
+            if common_hits >= 1 or len(latin_words) >= 6:
+                return "english"
+        return None
+
+    def __select_stream(
+        self,
+        streams: List[SubtitleStream],
+        target: str,
+        language_map: Optional[Dict[int, str]] = None,
+        exclude_indices: Optional[set] = None,
+    ) -> Optional[SubtitleStream]:
         candidates: List[Tuple[int, SubtitleStream]] = []
         for stream in streams:
-            score = self.__score_stream(stream, target=target)
+            if exclude_indices and stream.index in exclude_indices:
+                continue
+            score = self.__score_stream(stream, target=target, language_map=language_map)
             if score > 0:
                 candidates.append((score, stream))
         if not candidates:
@@ -1604,11 +1680,18 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         candidates.sort(key=lambda item: item[0], reverse=True)
         return candidates[0][1]
 
-    def __score_stream(self, stream: SubtitleStream, target: str) -> int:
+    def __score_stream(self, stream: SubtitleStream, target: str, language_map: Optional[Dict[int, str]] = None) -> int:
         language = (stream.language or "").lower()
         title = (stream.title or "").lower()
         hints = ENGLISH_HINTS if target == "english" else CHINESE_HINTS
         score = 0
+        detected = (language_map or {}).get(stream.index)
+
+        if detected:
+            if detected == target:
+                score += 240
+            else:
+                return -1000
 
         if language in hints:
             score += 120
@@ -1619,7 +1702,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             score += 50
 
         if stream.is_text:
-            score += 30
+            score += 20
         if stream.is_default:
             score += 20
         if stream.is_forced:

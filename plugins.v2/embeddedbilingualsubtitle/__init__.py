@@ -303,7 +303,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -1389,11 +1389,54 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         if not task:
             return
         text = stage if not detail else f"{stage} - {detail}"
+        state = self._run_states.get(task.run_id) or {}
+        previous_stage = state.get("stage")
         self.__update_run_state(
             task.run_id,
             current_file=str(current_file or task.file_path),
             stage=text,
             running=True,
+        )
+        if text != previous_stage:
+            logger.info(f"任务阶段更新：{current_file or task.file_path} -> {text}")
+
+    @staticmethod
+    def __describe_subtitle_stream(stream: SubtitleStream, language_map: Optional[Dict[int, str]] = None) -> str:
+        detected = (language_map or {}).get(stream.index) or "-"
+        return (
+            f"stream {stream.index}"
+            f"[codec={stream.codec_name or '-'}"
+            f", lang={stream.language or '-'}"
+            f", title={stream.title or '-'}"
+            f", text={'Y' if stream.is_text else 'N'}"
+            f", default={'Y' if stream.is_default else 'N'}"
+            f", forced={'Y' if stream.is_forced else 'N'}"
+            f", detected={detected}]"
+        )
+
+    @staticmethod
+    def __describe_audio_stream(stream: AudioStream) -> str:
+        return (
+            f"stream {stream.index}"
+            f"[codec={stream.codec_name or '-'}"
+            f", lang={stream.language or '-'}"
+            f", title={stream.title or '-'}"
+            f", default={'Y' if stream.is_default else 'N'}]"
+        )
+
+    def __log_stream_candidates(
+        self,
+        file_path: Path,
+        label: str,
+        streams: List[SubtitleStream],
+        language_map: Optional[Dict[int, str]] = None,
+    ) -> None:
+        if not streams:
+            logger.info(f"{file_path} {label}候选：无")
+            return
+        logger.info(
+            f"{file_path} {label}候选："
+            + " | ".join(self.__describe_subtitle_stream(stream, language_map) for stream in streams[:6])
         )
 
     def __expand_custom_path(self, path: Path) -> List[Path]:
@@ -1541,10 +1584,20 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             self.__update_task_stage("读取字幕流元数据", current_file=file_path)
             streams = self.__probe_subtitle_streams(file_path)
             text_streams = [stream for stream in streams if stream.is_text]
+            logger.info(
+                f"{file_path} 字幕流探测完成：总计 {len(streams)} 条，文本字幕 {len(text_streams)} 条"
+            )
             language_map = {}
             if text_streams:
                 self.__update_task_stage("识别字幕流语言", current_file=file_path, detail=f"{len(text_streams)} 条文本流")
                 language_map = self.__inspect_stream_languages(file_path, text_streams)
+                if language_map:
+                    logger.info(
+                        f"{file_path} 字幕语言识别结果："
+                        + ", ".join(f"stream {index} -> {target}" for index, target in sorted(language_map.items()))
+                    )
+                else:
+                    logger.info(f"{file_path} 字幕语言识别结果为空，将仅按元数据和评分选择候选流")
 
             english_candidates = self.__rank_streams(
                 streams,
@@ -1567,9 +1620,16 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 language_map=language_map,
                 exclude_indices={english_stream.index} if english_stream else None,
             )
+            self.__log_stream_candidates(file_path, "英文字幕", english_candidates, language_map)
+            self.__log_stream_candidates(file_path, "中文字幕", chinese_candidates, language_map)
+            if chinese_any_stream and not chinese_candidates:
+                logger.info(
+                    f"{file_path} 存在非文本中文字幕候选：{self.__describe_subtitle_stream(chinese_any_stream, language_map)}"
+                )
 
             if not streams or (not english_stream and not chinese_any_stream):
                 if self._enable_asr_fallback:
+                    logger.warn(f"{file_path} 未找到可用字幕流，回退到音轨识别")
                     self.__update_task_stage("回退音轨识别", current_file=file_path)
                     return self.__process_with_asr_fallback(file_path=file_path, output_path=output_path)
                 return ProcessResult(
@@ -1583,6 +1643,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 image_english_stream = self.__select_stream(streams, target="english", language_map=language_map)
                 if image_english_stream and not image_english_stream.is_text:
                     if self._enable_asr_fallback:
+                        logger.warn(
+                            f"{file_path} 仅找到图片英文字幕 {self.__describe_subtitle_stream(image_english_stream, language_map)}，回退到音轨识别"
+                        )
                         self.__update_task_stage("回退音轨识别", current_file=file_path)
                         return self.__process_with_asr_fallback(file_path=file_path, output_path=output_path)
                     return ProcessResult(
@@ -1593,6 +1656,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                         english_stream=str(image_english_stream.index),
                     )
                 if self._enable_asr_fallback:
+                    logger.warn(f"{file_path} 未找到可用英文文本字幕流，回退到音轨识别")
                     self.__update_task_stage("回退音轨识别", current_file=file_path)
                     return self.__process_with_asr_fallback(file_path=file_path, output_path=output_path)
                 return ProcessResult(file_path=str(file_path), status="failed", mode="probe", reason="未找到可用英文文本字幕流")
@@ -1614,6 +1678,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             )
             if not english_stream or not english_cues:
                 if self._enable_asr_fallback:
+                    logger.warn(f"{file_path} 英文字幕抽取失败，回退到音轨识别：{english_extract_error}")
                     self.__update_task_stage("回退音轨识别", current_file=file_path)
                     return self.__process_with_asr_fallback(file_path=file_path, output_path=output_path)
                 return ProcessResult(
@@ -1639,6 +1704,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             if chinese_text_stream and chinese_cues:
                 self.__update_task_stage("合并中英字幕", current_file=file_path, detail=f"{len(english_cues)} 条")
                 bilingual_cues, coverage = _build_bilingual_cues(english_cues, chinese_cues)
+                logger.info(
+                    f"{file_path} 中英字幕合并完成：英文 {len(english_cues)} 条，中文 {len(chinese_cues)} 条，覆盖率 {coverage:.0%}"
+                )
                 if coverage < 0.35:
                     return ProcessResult(
                         file_path=str(file_path),
@@ -1680,6 +1748,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 )
 
             self.__update_task_stage("翻译英文字幕", current_file=file_path, detail=f"{len(english_cues)} 条")
+            logger.info(f"{file_path} 开始翻译英文字幕：共 {len(english_cues)} 条，模型 {self._translate_model}")
             chinese_lines = self.__translate_cues(english_cues)
             bilingual_cues = [
                 SubtitleCue(
@@ -1769,6 +1838,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     is_forced=bool(disposition.get("forced")),
                 )
             )
+        if streams:
+            logger.info(
+                f"{file_path} 检测到字幕流："
+                + " | ".join(self.__describe_subtitle_stream(stream) for stream in streams)
+            )
+        else:
+            logger.info(f"{file_path} 未检测到任何字幕流")
         return streams
 
     def __probe_audio_streams(self, file_path: Path) -> List[AudioStream]:
@@ -1816,6 +1892,13 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     is_default=bool(disposition.get("default")),
                 )
             )
+        if streams:
+            logger.info(
+                f"{file_path} 检测到音轨："
+                + " | ".join(self.__describe_audio_stream(stream) for stream in streams)
+            )
+        else:
+            logger.info(f"{file_path} 未检测到任何音轨")
         return streams
 
     def __select_audio_stream(self, streams: List[AudioStream]) -> Optional[AudioStream]:
@@ -1868,6 +1951,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 mode="asr",
                 reason="未找到英文音轨，无法进行音轨识别",
             )
+        logger.info(
+            f"{file_path} 启用音轨识别回退，选择音轨：{self.__describe_audio_stream(audio_stream)}，Whisper 模型：{self._whisper_model}"
+        )
 
         temp_dir = Path(settings.TEMP_PATH) / "embeddedbilingualsubtitle" / "asr"
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -1886,6 +1972,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     mode="asr",
                     reason="音轨识别未生成任何字幕",
                 )
+            logger.info(f"{file_path} Whisper 识别完成：生成英文字幕 {len(english_cues)} 条")
             _write_srt_file(english_srt, english_cues)
             self.__update_task_stage("翻译英文字幕", current_file=file_path, detail=f"{len(english_cues)} 条")
             chinese_lines = self.__translate_cues(english_cues)
@@ -1926,6 +2013,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             metadata_target = self.__detect_target_from_metadata(stream)
             if metadata_target:
                 language_map[stream.index] = metadata_target
+                logger.info(
+                    f"{file_path} 字幕流语言命中元数据：stream {stream.index} -> {metadata_target}"
+                )
                 continue
             unresolved_streams.append(stream)
 
@@ -1938,6 +2028,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             "抽样识别字幕流语言",
             current_file=file_path,
             detail=f"0/{len(sample_streams)}，{max_workers} 路并发",
+        )
+        logger.info(
+            f"{file_path} 开始抽样识别字幕流语言：待抽样 {len(sample_streams)} 条，最多并发 {max_workers}，时长限制 {SUBTITLE_SAMPLE_DURATION_SECONDS}s，超时 {SUBTITLE_SAMPLE_TIMEOUT_SECONDS}s"
         )
 
         detected_targets = set(language_map.values())
@@ -1961,10 +2054,14 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     if detected:
                         language_map[stream.index] = detected
                         detected_targets.add(detected)
+                        logger.info(f"{file_path} 字幕流抽样识别成功：stream {stream.index} -> {detected}")
+                    else:
+                        logger.info(f"{file_path} 字幕流抽样未识别出语言：stream {stream.index}")
                 except Exception as err:
-                    logger.debug(f"字幕流语言探测失败，stream={stream.index}: {str(err)}")
+                    logger.warn(f"{file_path} 字幕流语言探测失败，stream={stream.index}：{str(err)}")
 
                 if "english" in detected_targets and "chinese" in detected_targets:
+                    logger.info(f"{file_path} 已同时识别到英文和中文字幕流，提前结束抽样")
                     break
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -1975,6 +2072,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         temp_dir.mkdir(parents=True, exist_ok=True)
         sample_file = temp_dir / f"detect_{file_path.stem}_{stream.index}_{threading.get_ident()}.srt"
         try:
+            logger.info(
+                f"{file_path} 开始抽样提取字幕流：stream {stream.index}，时长 {SUBTITLE_SAMPLE_DURATION_SECONDS}s，超时 {SUBTITLE_SAMPLE_TIMEOUT_SECONDS}s"
+            )
             self.__extract_stream_to_srt(
                 file_path=file_path,
                 stream=stream,
@@ -1985,8 +2085,10 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             )
             cues = _parse_srt_file(sample_file)[:SUBTITLE_SAMPLE_CUE_LIMIT]
             if not cues:
+                logger.info(f"{file_path} 字幕流抽样为空：stream {stream.index}")
                 return None
             sample_text = "\n".join(cue.text for cue in cues)
+            logger.info(f"{file_path} 字幕流抽样完成：stream {stream.index}，样本 {len(cues)} 条")
             return self.__detect_target_from_text(sample_text)
         finally:
             try:
@@ -2158,10 +2260,14 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 current_file=file_path,
                 detail=f"stream {stream.index} ({attempt}/{len(candidates)})",
             )
+            logger.info(
+                f"{file_path} 开始{role_name}字幕抽取：{self.__describe_subtitle_stream(stream)}，尝试 {attempt}/{len(candidates)}"
+            )
             try:
                 self.__extract_stream_to_srt(file_path=file_path, stream=stream, output_path=output_path)
                 cues = _parse_srt_file(output_path)
                 if cues:
+                    logger.info(f"{file_path} {role_name}字幕抽取成功：stream {stream.index}，共 {len(cues)} 条")
                     if attempt > 1:
                         logger.info(f"{file_path} {role_name}字幕流切换成功，已改用 stream {stream.index}")
                     return stream, cues, ""
@@ -2325,6 +2431,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     def __translate_cues(self, english_cues: List[SubtitleCue]) -> List[str]:
         translations: List[str] = []
         total_batches = max(1, (len(english_cues) + self._translate_batch_size - 1) // self._translate_batch_size)
+        logger.info(
+            f"开始批量翻译字幕：共 {len(english_cues)} 条，批大小 {self._translate_batch_size}，批次数 {total_batches}，模型 {self._translate_model}"
+        )
         for batch_index, start in enumerate(range(0, len(english_cues), self._translate_batch_size), start=1):
             batch = english_cues[start:start + self._translate_batch_size]
             self.__update_task_stage(
@@ -2332,9 +2441,11 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 detail=f"{batch_index}/{total_batches}，本批 {len(batch)} 条",
             )
             try:
+                logger.info(f"开始翻译批次 {batch_index}/{total_batches}，条数 {len(batch)}")
                 batch_translations = self.__translate_batch(batch)
                 self.__validate_translations(batch, batch_translations)
                 translations.extend(batch_translations)
+                logger.info(f"翻译批次 {batch_index}/{total_batches} 成功")
             except Exception as err:
                 logger.warning(f"批量翻译结果异常，降级逐条翻译：{str(err)}")
                 for cue in batch:

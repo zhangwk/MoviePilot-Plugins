@@ -330,7 +330,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.8"
+    plugin_version = "1.3.9"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -931,14 +931,34 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             key=lambda item: item.get("queued_at") or "",
             reverse=True,
         )
-        active_run = None
-        for state in run_states:
-            if state.get("running") or (
-                state.get("total", 0) > 0 and state.get("completed", 0) < state.get("total", 0)
-            ):
-                active_run = state
-                break
+        run_state_map = {item.get("run_id"): item for item in run_states if item.get("run_id")}
+        current_task = self._current_task
+        current_run = run_state_map.get(current_task.run_id) if current_task else None
+        if not current_run:
+            for state in run_states:
+                if state.get("running"):
+                    current_run = state
+                    break
         queue_size = self._task_queue.qsize() if self._task_queue else 0
+        queued_tasks: List[QueueTask] = []
+        if self._task_queue:
+            with self._task_queue.mutex:
+                queued_tasks = [task for task in list(self._task_queue.queue) if task]
+        queue_headers = [
+            {"title": "顺序", "key": "position"},
+            {"title": "来源", "key": "source"},
+            {"title": "批次", "key": "run_id"},
+            {"title": "文件", "key": "file_path"},
+        ]
+        queue_items = [
+            {
+                "position": index,
+                "source": task.source or "-",
+                "run_id": task.run_id or "-",
+                "file_path": task.file_path or "-",
+            }
+            for index, task in enumerate(queued_tasks[:50], start=1)
+        ]
         headers = [
             {"title": "时间", "key": "time"},
             {"title": "状态", "key": "status"},
@@ -1084,17 +1104,48 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                             {
                                 "component": "VAlert",
                                 "props": {
-                                    "type": "info" if active_run else "success",
+                                    "type": "info" if current_task or queue_size else "success",
                                     "variant": "tonal",
                                     "text": (
-                                        f"队列待处理：{queue_size} 个\n"
-                                        f"当前任务：{(active_run or {}).get('current_file') or '-'}\n"
-                                        f"当前阶段：{(active_run or {}).get('stage') or '空闲'}\n"
-                                        f"当前进度：{(active_run or {}).get('completed', 0)}/{(active_run or {}).get('total', 0)}\n"
-                                        f"当前批次结果：成功 {(active_run or {}).get('success', 0)} / "
-                                        f"失败 {(active_run or {}).get('failed', 0)} / "
-                                        f"跳过 {(active_run or {}).get('skipped', 0)}"
+                                        f"执行中：{1 if current_task else 0} 个\n"
+                                        f"等待队列：{queue_size} 个\n"
+                                        f"当前执行：{(current_task.file_path if current_task else (current_run or {}).get('current_file')) or '-'}\n"
+                                        f"当前阶段：{(current_run or {}).get('stage') or ('排队中' if queue_size else '空闲')}\n"
+                                        f"当前批次进度：{(current_run or {}).get('completed', 0)}/{(current_run or {}).get('total', 0)}\n"
+                                        f"当前批次结果：成功 {(current_run or {}).get('success', 0)} / "
+                                        f"失败 {(current_run or {}).get('failed', 0)} / "
+                                        f"跳过 {(current_run or {}).get('skipped', 0)}\n"
+                                        f"队列总任务视图：当前执行 {1 if current_task else 0} + 等待 {queue_size}"
                                     ),
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "component": "VRow",
+                "props": {
+                    "style": {
+                        "overflow": "hidden",
+                    }
+                },
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VDataTableVirtual",
+                                "props": {
+                                    "class": "text-sm",
+                                    "headers": queue_headers,
+                                    "items": queue_items,
+                                    "height": "14rem",
+                                    "density": "compact",
+                                    "fixed-header": True,
+                                    "hide-no-data": False,
+                                    "hover": True,
                                 },
                             }
                         ],

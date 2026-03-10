@@ -5,6 +5,7 @@ import re
 import subprocess
 import threading
 import time
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from dataclasses import dataclass
@@ -94,6 +95,7 @@ SUBTITLE_SAMPLE_CUE_LIMIT = 12
 ENGLISH_RECHECK_STREAM_LIMIT = 6
 ENGLISH_RECHECK_DURATION_SECONDS = 90
 ENGLISH_RECHECK_TIMEOUT_SECONDS = 8
+ASR_CACHE_SCHEMA_VERSION = 1
 
 WHISPER_MODEL_OPTIONS = [
     {"title": "tiny", "value": "tiny"},
@@ -330,7 +332,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.9"
+    plugin_version = "1.3.10"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -2231,21 +2233,27 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         temp_prefix = f"{file_path.stem}_{int(datetime.now().timestamp())}_{threading.get_ident()}"
         wav_path = temp_dir / f"{temp_prefix}.wav"
         english_srt = temp_dir / f"{temp_prefix}.eng.srt"
+        english_cues: List[SubtitleCue] = []
         try:
-            self.__update_task_stage("抽取英文音轨", current_file=file_path, detail=f"stream {audio_stream.index}")
-            self.__extract_audio_to_wav(file_path=file_path, stream=audio_stream, output_path=wav_path)
-            self.__raise_if_cancelled(file_path)
-            self.__update_task_stage("Whisper 识别英文音轨", current_file=file_path, detail=self._whisper_model)
-            english_cues = self.__transcribe_audio_to_cues(wav_path)
-            if not english_cues:
-                return ProcessResult(
-                    file_path=str(file_path),
-                    status="failed",
-                    mode="asr",
-                    reason="音轨识别未生成任何字幕",
-                )
-            logger.info(f"{file_path} Whisper 识别完成：生成英文字幕 {len(english_cues)} 条")
-            _write_srt_file(english_srt, english_cues)
+            english_cues = self.__load_asr_cache(file_path=file_path, audio_stream=audio_stream)
+            if english_cues:
+                self.__update_task_stage("复用英文识别缓存", current_file=file_path, detail=f"{len(english_cues)} 条")
+            else:
+                self.__update_task_stage("抽取英文音轨", current_file=file_path, detail=f"stream {audio_stream.index}")
+                self.__extract_audio_to_wav(file_path=file_path, stream=audio_stream, output_path=wav_path)
+                self.__raise_if_cancelled(file_path)
+                self.__update_task_stage("Whisper 识别英文音轨", current_file=file_path, detail=self._whisper_model)
+                english_cues = self.__transcribe_audio_to_cues(wav_path)
+                if not english_cues:
+                    return ProcessResult(
+                        file_path=str(file_path),
+                        status="failed",
+                        mode="asr",
+                        reason="音轨识别未生成任何字幕",
+                    )
+                logger.info(f"{file_path} Whisper 识别完成：生成英文字幕 {len(english_cues)} 条")
+                _write_srt_file(english_srt, english_cues)
+                self.__save_asr_cache(file_path=file_path, audio_stream=audio_stream, english_cues=english_cues)
             self.__raise_if_cancelled(file_path)
             self.__update_task_stage("翻译英文字幕", current_file=file_path, detail=f"{len(english_cues)} 条")
             chinese_lines = self.__translate_cues(english_cues)
@@ -2557,6 +2565,62 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     def __is_missing_whisper_vad_asset(error_text: str) -> bool:
         text = (error_text or "").lower()
         return "silero_vad.onnx" in text or ("vad" in text and "no_suchfile" in text)
+
+    def __build_asr_cache_paths(self, file_path: Path) -> Tuple[Path, Path]:
+        cache_dir = self.get_data_path() / "asr-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha1(str(file_path).encode("utf-8")).hexdigest()
+        base_name = f"{digest}_{file_path.stem[:48]}"
+        return cache_dir / f"{base_name}.json", cache_dir / f"{base_name}.eng.srt"
+
+    def __load_asr_cache(self, file_path: Path, audio_stream: AudioStream) -> List[SubtitleCue]:
+        meta_path, srt_path = self.__build_asr_cache_paths(file_path)
+        if not meta_path.exists() or not srt_path.exists():
+            return []
+        try:
+            stat = file_path.stat()
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta.get("schema_version") != ASR_CACHE_SCHEMA_VERSION:
+                return []
+            if meta.get("file_path") != str(file_path):
+                return []
+            if int(meta.get("file_size") or -1) != int(stat.st_size):
+                return []
+            if int(meta.get("file_mtime_ns") or -1) != int(stat.st_mtime_ns):
+                return []
+            if int(meta.get("audio_stream_index") or -1) != int(audio_stream.index):
+                return []
+            if (meta.get("whisper_model") or "") != (self._whisper_model or ""):
+                return []
+            cues = _parse_srt_file(srt_path)
+            if not cues:
+                return []
+            logger.info(f"{file_path} 命中英文识别缓存：{srt_path.name}，共 {len(cues)} 条")
+            return cues
+        except Exception as err:
+            logger.warn(f"{file_path} 读取英文识别缓存失败，将重新进行 Whisper 识别：{str(err)}")
+            return []
+
+    def __save_asr_cache(self, file_path: Path, audio_stream: AudioStream, english_cues: List[SubtitleCue]) -> None:
+        if not english_cues:
+            return
+        meta_path, srt_path = self.__build_asr_cache_paths(file_path)
+        try:
+            stat = file_path.stat()
+            meta = {
+                "schema_version": ASR_CACHE_SCHEMA_VERSION,
+                "file_path": str(file_path),
+                "file_size": int(stat.st_size),
+                "file_mtime_ns": int(stat.st_mtime_ns),
+                "audio_stream_index": int(audio_stream.index),
+                "whisper_model": self._whisper_model,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            _write_srt_file(srt_path, english_cues)
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info(f"{file_path} 已写入英文识别缓存：{srt_path.name}，共 {len(english_cues)} 条")
+        except Exception as err:
+            logger.warn(f"{file_path} 写入英文识别缓存失败：{str(err)}")
 
     def __extract_stream_to_srt(
         self,

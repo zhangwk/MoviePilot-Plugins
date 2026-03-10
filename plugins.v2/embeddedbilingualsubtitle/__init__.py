@@ -96,6 +96,8 @@ ENGLISH_RECHECK_STREAM_LIMIT = 6
 ENGLISH_RECHECK_DURATION_SECONDS = 90
 ENGLISH_RECHECK_TIMEOUT_SECONDS = 8
 ASR_CACHE_SCHEMA_VERSION = 1
+WHISPER_PROGRESS_INTERVAL_SECONDS = 10
+WHISPER_PROGRESS_MIN_PERCENT_STEP = 5.0
 
 WHISPER_MODEL_OPTIONS = [
     {"title": "tiny", "value": "tiny"},
@@ -332,7 +334,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.10"
+    plugin_version = "1.3.11"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -2243,7 +2245,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 self.__extract_audio_to_wav(file_path=file_path, stream=audio_stream, output_path=wav_path)
                 self.__raise_if_cancelled(file_path)
                 self.__update_task_stage("Whisper 识别英文音轨", current_file=file_path, detail=self._whisper_model)
-                english_cues = self.__transcribe_audio_to_cues(wav_path)
+                english_cues = self.__transcribe_audio_to_cues(audio_file=wav_path, source_file=file_path)
                 if not english_cues:
                     return ProcessResult(
                         file_path=str(file_path),
@@ -2566,6 +2568,28 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         text = (error_text or "").lower()
         return "silero_vad.onnx" in text or ("vad" in text and "no_suchfile" in text)
 
+    @staticmethod
+    def __build_whisper_progress_detail(processed_seconds: float, total_seconds: float, cue_count: int) -> str:
+        processed_label = f"{max(0, int(processed_seconds))}s"
+        if total_seconds > 0:
+            percent = min(100.0, max(0.0, processed_seconds * 100.0 / total_seconds))
+            return f"{percent:.0f}% ({processed_label}/{max(1, int(total_seconds))}s，{cue_count} 条)"
+        return f"已生成 {cue_count} 条，最新时间点 {processed_label}"
+
+    @staticmethod
+    def __should_emit_whisper_progress(
+        cue_count: int,
+        now: float,
+        last_emit_at: float,
+        percent: Optional[float],
+        last_percent: float,
+    ) -> bool:
+        if cue_count <= 1:
+            return True
+        if percent is not None and (last_percent < 0 or percent - last_percent >= WHISPER_PROGRESS_MIN_PERCENT_STEP):
+            return True
+        return (now - last_emit_at) >= WHISPER_PROGRESS_INTERVAL_SECONDS
+
     def __build_asr_cache_paths(self, file_path: Path) -> Tuple[Path, Path]:
         cache_dir = self.get_data_path() / "asr-cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -2745,7 +2769,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             message = completed.stderr.strip() or completed.stdout.strip() or "未知错误"
             raise RuntimeError(f"音频抽取失败：{message.splitlines()[-1]}")
 
-    def __transcribe_audio_to_cues(self, audio_file: Path) -> List[SubtitleCue]:
+    def __transcribe_audio_to_cues(self, audio_file: Path, source_file: Optional[Path] = None) -> List[SubtitleCue]:
         try:
             from faster_whisper import WhisperModel
         except ImportError:
@@ -2804,9 +2828,19 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         if detected_language and not detected_language.startswith("en"):
             raise RuntimeError(f"音轨识别语言不是英文：{detected_language}")
 
+        progress_file = source_file or audio_file
+        total_seconds = float(getattr(info, "duration", 0) or 0)
+        if total_seconds > 0:
+            logger.info(f"{progress_file} Whisper 识别总时长约 {int(total_seconds)}s，开始输出进度")
+        else:
+            logger.info(f"{progress_file} Whisper 无法获取总时长，将按已生成字幕条数输出进度")
+
         cues: List[SubtitleCue] = []
+        started_at = time.monotonic()
+        last_emit_at = 0.0
+        last_percent = -1.0
         for segment in segments:
-            self.__raise_if_cancelled(audio_file)
+            self.__raise_if_cancelled(progress_file)
             text = _normalize_text(getattr(segment, "text", "") or "")
             if not text:
                 continue
@@ -2822,6 +2856,35 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     text=text,
                 )
             )
+            processed_seconds = max(start_ms, end_ms) / 1000.0
+            percent = min(100.0, processed_seconds * 100.0 / total_seconds) if total_seconds > 0 else None
+            now = time.monotonic()
+            if self.__should_emit_whisper_progress(
+                cue_count=len(cues),
+                now=now,
+                last_emit_at=last_emit_at,
+                percent=percent,
+                last_percent=last_percent,
+            ):
+                detail = self.__build_whisper_progress_detail(
+                    processed_seconds=processed_seconds,
+                    total_seconds=total_seconds,
+                    cue_count=len(cues),
+                )
+                self.__update_task_stage("Whisper 识别英文音轨", current_file=progress_file, detail=detail)
+                logger.info(
+                    f"{progress_file} Whisper 识别进度：{detail}，已耗时 {int(now - started_at)}s"
+                )
+                last_emit_at = now
+                if percent is not None:
+                    last_percent = percent
+        if cues:
+            final_detail = self.__build_whisper_progress_detail(
+                processed_seconds=max(cues[-1].end_ms / 1000.0, total_seconds),
+                total_seconds=total_seconds,
+                cue_count=len(cues),
+            )
+            self.__update_task_stage("Whisper 识别英文音轨", current_file=progress_file, detail=final_detail)
         return cues
 
     def __translation_ready(self) -> bool:

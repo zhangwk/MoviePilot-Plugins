@@ -91,6 +91,9 @@ SUBTITLE_SAMPLE_CONCURRENCY = 2
 SUBTITLE_SAMPLE_DURATION_SECONDS = 180
 SUBTITLE_SAMPLE_TIMEOUT_SECONDS = 35
 SUBTITLE_SAMPLE_CUE_LIMIT = 12
+ENGLISH_RECHECK_STREAM_LIMIT = 6
+ENGLISH_RECHECK_DURATION_SECONDS = 90
+ENGLISH_RECHECK_TIMEOUT_SECONDS = 8
 
 WHISPER_MODEL_OPTIONS = [
     {"title": "tiny", "value": "tiny"},
@@ -327,7 +330,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.7"
+    plugin_version = "1.3.8"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -1815,6 +1818,18 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 language_map=language_map,
                 prefer_text=True,
             )
+            if not english_candidates and text_streams:
+                language_map = self.__recheck_missing_english_streams(
+                    file_path=file_path,
+                    streams=text_streams,
+                    language_map=language_map,
+                )
+                english_candidates = self.__rank_streams(
+                    streams,
+                    target="english",
+                    language_map=language_map,
+                    prefer_text=True,
+                )
             english_stream = english_candidates[0] if english_candidates else None
             chinese_candidates = self.__rank_streams(
                 streams,
@@ -2281,21 +2296,71 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             executor.shutdown(wait=False, cancel_futures=True)
         return language_map
 
-    def __sample_stream_language(self, file_path: Path, stream: SubtitleStream) -> Optional[str]:
+    def __recheck_missing_english_streams(
+        self,
+        file_path: Path,
+        streams: List[SubtitleStream],
+        language_map: Dict[int, str],
+    ) -> Dict[int, str]:
+        self.__raise_if_cancelled(file_path)
+        candidate_streams = [
+            stream
+            for stream in streams
+            if stream.index not in language_map
+            and stream.is_text
+            and (stream.language or "").lower() not in CHINESE_HINTS
+        ][:ENGLISH_RECHECK_STREAM_LIMIT]
+        if not candidate_streams:
+            return language_map
+
+        logger.info(
+            f"{file_path} 未找到英文字幕证据，开始有限反查其他文本流：最多 {len(candidate_streams)} 条，时长 {ENGLISH_RECHECK_DURATION_SECONDS}s，超时 {ENGLISH_RECHECK_TIMEOUT_SECONDS}s"
+        )
+        for seq, stream in enumerate(candidate_streams, start=1):
+            self.__raise_if_cancelled(file_path)
+            self.__update_task_stage(
+                "反查英文字幕流",
+                current_file=file_path,
+                detail=f"{seq}/{len(candidate_streams)}，stream {stream.index}",
+            )
+            try:
+                detected = self.__sample_stream_language(
+                    file_path=file_path,
+                    stream=stream,
+                    duration_seconds=ENGLISH_RECHECK_DURATION_SECONDS,
+                    timeout_seconds=ENGLISH_RECHECK_TIMEOUT_SECONDS,
+                    sample_label="反查抽样提取字幕流",
+                )
+                if detected == "english":
+                    language_map[stream.index] = "english"
+                    logger.info(f"{file_path} 反查命中英文字幕流：stream {stream.index}")
+                    break
+            except Exception as err:
+                logger.info(f"{file_path} 反查英文字幕流失败，stream {stream.index}：{str(err)}")
+        return language_map
+
+    def __sample_stream_language(
+        self,
+        file_path: Path,
+        stream: SubtitleStream,
+        duration_seconds: int = SUBTITLE_SAMPLE_DURATION_SECONDS,
+        timeout_seconds: int = SUBTITLE_SAMPLE_TIMEOUT_SECONDS,
+        sample_label: str = "开始抽样提取字幕流",
+    ) -> Optional[str]:
         temp_dir = Path(settings.TEMP_PATH) / "embeddedbilingualsubtitle" / "detect"
         temp_dir.mkdir(parents=True, exist_ok=True)
         sample_file = temp_dir / f"detect_{file_path.stem}_{stream.index}_{threading.get_ident()}.srt"
         try:
             logger.info(
-                f"{file_path} 开始抽样提取字幕流：stream {stream.index}，时长 {SUBTITLE_SAMPLE_DURATION_SECONDS}s，超时 {SUBTITLE_SAMPLE_TIMEOUT_SECONDS}s"
+                f"{file_path} {sample_label}：stream {stream.index}，时长 {duration_seconds}s，超时 {timeout_seconds}s"
             )
             self.__extract_stream_to_srt(
                 file_path=file_path,
                 stream=stream,
                 output_path=sample_file,
-                timeout=SUBTITLE_SAMPLE_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
                 start_seconds=0,
-                duration_limit=SUBTITLE_SAMPLE_DURATION_SECONDS,
+                duration_limit=duration_seconds,
             )
             cues = _parse_srt_file(sample_file)[:SUBTITLE_SAMPLE_CUE_LIMIT]
             if not cues:

@@ -84,6 +84,8 @@ ENGLISH_COMMON_WORDS = {
 ffmpeg_lock = threading.Lock()
 DEFAULT_SILICONFLOW_URL = "https://api.siliconflow.cn/v1"
 DEFAULT_TEST_TEXT = "We need to leave before sunrise, or we will miss the last train."
+DEFAULT_TRANSLATE_MODEL = "Qwen/Qwen2.5-32B-Instruct"
+DEFAULT_TRANSLATE_FALLBACKS = "deepseek-ai/DeepSeek-V3.2\nPro/MiniMaxAI/MiniMax-M2.5"
 FFPROBE_TIMEOUT_SECONDS = 90
 FFMPEG_EXTRACT_TIMEOUT_SECONDS = 300
 AUDIO_EXTRACT_TIMEOUT_SECONDS = 900
@@ -98,6 +100,7 @@ ENGLISH_RECHECK_TIMEOUT_SECONDS = 8
 ASR_CACHE_SCHEMA_VERSION = 1
 WHISPER_PROGRESS_INTERVAL_SECONDS = 10
 WHISPER_PROGRESS_MIN_PERCENT_STEP = 5.0
+MAX_TRANSLATION_FALLBACK_ROUTES = 2
 
 WHISPER_MODEL_OPTIONS = [
     {"title": "tiny", "value": "tiny"},
@@ -149,6 +152,14 @@ class AudioStream:
     language: str
     title: str
     is_default: bool
+
+
+@dataclass
+class TranslationRoute:
+    url: str
+    model: str
+    api_key: str = ""
+    source: str = "primary"
 
 
 @dataclass
@@ -334,7 +345,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.11"
+    plugin_version = "1.3.14"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -361,7 +372,8 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     _whisper_use_proxy = True
     _translate_url = DEFAULT_SILICONFLOW_URL
     _translate_api_key = ""
-    _translate_model = ""
+    _translate_model = DEFAULT_TRANSLATE_MODEL
+    _translate_fallbacks = DEFAULT_TRANSLATE_FALLBACKS
     _translate_batch_size = 20
     _translate_timeout = 180
     _test_onlyonce = False
@@ -400,7 +412,8 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             self._whisper_use_proxy = bool(config.get("whisper_use_proxy", True))
             self._translate_url = (config.get("translate_url") or DEFAULT_SILICONFLOW_URL).strip()
             self._translate_api_key = (config.get("translate_api_key") or "").strip()
-            self._translate_model = (config.get("translate_model") or "").strip()
+            self._translate_model = (config.get("translate_model") or DEFAULT_TRANSLATE_MODEL).strip()
+            self._translate_fallbacks = config.get("translate_fallbacks") or DEFAULT_TRANSLATE_FALLBACKS
             self._translate_batch_size = max(1, min(int(config.get("translate_batch_size") or 20), 50))
             self._translate_timeout = max(30, min(int(config.get("translate_timeout") or 180), 600))
             self._test_onlyonce = bool(config.get("test_onlyonce"))
@@ -634,6 +647,31 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "translate_fallbacks",
+                                            "label": "翻译后备路由",
+                                            "rows": 3,
+                                            "placeholder": (
+                                                "最多填写 2 个后备项，每行一个。支持三种格式：\n"
+                                                "1. 仅模型名：沿用上面的地址和 API Key\n"
+                                                "2. 接口地址|模型名\n"
+                                                "3. 接口地址|模型名|API Key"
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
@@ -801,7 +839,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                                         "props": {
                                             "model": "translate_model",
                                             "label": "硅基流动模型",
-                                            "placeholder": "填写完整模型名，例如 Qwen/Qwen2.5-72B-Instruct",
+                                            "placeholder": f"默认 {DEFAULT_TRANSLATE_MODEL}",
                                         },
                                     }
                                 ],
@@ -888,7 +926,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "默认按硅基流动 OpenAI 兼容接口工作。若没有可用字幕，可启用 faster-whisper 从英文音轨生成英文字幕，再翻译成中英双语字幕。",
+                                            "text": f"默认翻译路由已推荐为 {DEFAULT_TRANSLATE_MODEL}，后备模型为 DeepSeek-V3.2 和 MiniMax-M2.5。若主翻译模型不稳定，可在“翻译后备路由”里最多填写 2 个备用模型或备用端点，任务会自动切换；若没有可用字幕，可启用 faster-whisper 从英文音轨生成英文字幕，再翻译成中英双语字幕。",
                                         },
                                     }
                                 ],
@@ -918,7 +956,8 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             "whisper_use_proxy": True,
             "translate_url": DEFAULT_SILICONFLOW_URL,
             "translate_api_key": "",
-            "translate_model": "",
+            "translate_model": DEFAULT_TRANSLATE_MODEL,
+            "translate_fallbacks": DEFAULT_TRANSLATE_FALLBACKS,
             "translate_batch_size": 20,
             "translate_timeout": 180,
             "test_text": DEFAULT_TEST_TEXT,
@@ -2891,12 +2930,12 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         return self.__translation_config_error() is None
 
     def __translation_config_error(self) -> Optional[str]:
-        if not self._translate_url:
-            return "未配置翻译接口地址"
-        if not self._translate_model:
-            return "未配置翻译模型"
-        if "siliconflow.cn" in self._translate_url.lower() and not self._translate_api_key:
-            return "硅基流动模式下必须填写 API Key"
+        try:
+            routes = self.__build_translation_routes()
+        except Exception as err:
+            return str(err)
+        if not routes:
+            return "未配置可用翻译路由"
         return None
 
     def __run_translate_test(self, source: str) -> dict:
@@ -2916,16 +2955,18 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             config_error = self.__translation_config_error()
             if config_error:
                 raise RuntimeError(config_error)
-            translated = self.__translate_batch(
+            translated, route = self.__translate_batch_with_failover(
                 [SubtitleCue(index=1, start_ms=0, end_ms=1000, text=test_text)]
             )
             result["output"] = translated[0]
             result["success"] = True
             result["reason"] = "测试翻译成功"
-            logger.info(f"硅基流动翻译测试成功，模型：{self._translate_model}")
+            result["model"] = route.model
+            result["endpoint"] = self.__build_translate_endpoint(route.url)
+            logger.info(f"翻译测试成功，路由：{self.__describe_translation_route(route)}")
         except Exception as err:
             result["reason"] = str(err)
-            logger.error(f"硅基流动翻译测试失败：{str(err)}")
+            logger.error(f"翻译测试失败：{str(err)}")
 
         self.save_data("last_translate_test", result)
         if self._notify:
@@ -2946,8 +2987,10 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     def __translate_cues(self, english_cues: List[SubtitleCue]) -> List[str]:
         translations: List[str] = []
         total_batches = max(1, (len(english_cues) + self._translate_batch_size - 1) // self._translate_batch_size)
+        routes = self.__build_translation_routes()
+        current_route_index = 0
         logger.info(
-            f"开始批量翻译字幕：共 {len(english_cues)} 条，批大小 {self._translate_batch_size}，批次数 {total_batches}，模型 {self._translate_model}"
+            f"开始批量翻译字幕：共 {len(english_cues)} 条，批大小 {self._translate_batch_size}，批次数 {total_batches}，路由数 {len(routes)}，首选 {self.__describe_translation_route(routes[0])}"
         )
         for batch_index, start in enumerate(range(0, len(english_cues), self._translate_batch_size), start=1):
             self.__raise_if_cancelled()
@@ -2958,10 +3001,15 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             )
             try:
                 logger.info(f"开始翻译批次 {batch_index}/{total_batches}，条数 {len(batch)}")
-                batch_translations = self.__translate_batch(batch)
+                batch_translations, route = self.__translate_batch_with_failover(
+                    cues=batch,
+                    routes=routes,
+                    preferred_index=current_route_index,
+                )
                 self.__validate_translations(batch, batch_translations)
                 translations.extend(batch_translations)
-                logger.info(f"翻译批次 {batch_index}/{total_batches} 成功")
+                current_route_index = routes.index(route)
+                logger.info(f"翻译批次 {batch_index}/{total_batches} 成功，使用 {self.__describe_translation_route(route)}")
             except Exception as err:
                 logger.warning(f"批量翻译结果异常，降级逐条翻译：{str(err)}")
                 for cue in batch:
@@ -2970,33 +3018,82 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                         "逐条重试翻译",
                         detail=f"{cue.index}/{len(english_cues)}",
                     )
-                    translations.append(self.__translate_single_cue(cue))
+                    translated, route = self.__translate_single_cue(
+                        cue=cue,
+                        routes=routes,
+                        preferred_index=current_route_index,
+                    )
+                    translations.append(translated)
+                    current_route_index = routes.index(route)
         if len(translations) != len(english_cues):
             raise RuntimeError("翻译结果数量与英文字幕条数不一致")
         return translations
 
-    def __translate_single_cue(self, cue: SubtitleCue) -> str:
+    def __translate_single_cue(
+        self,
+        cue: SubtitleCue,
+        routes: Optional[List[TranslationRoute]] = None,
+        preferred_index: int = 0,
+    ) -> Tuple[str, TranslationRoute]:
         last_error = None
         for attempt in range(3):
             self.__raise_if_cancelled()
             try:
-                translated = self.__translate_batch([cue], strict_mode=True)[0]
+                translations, route = self.__translate_batch_with_failover(
+                    cues=[cue],
+                    strict_mode=True,
+                    routes=routes,
+                    preferred_index=preferred_index,
+                )
+                translated = translations[0]
                 self.__validate_translations([cue], [translated])
-                return translated
+                return translated, route
             except Exception as err:
                 last_error = str(err)
                 logger.warning(f"单条翻译重试 {attempt + 1}/3 失败：{cue.text[:60]} -> {last_error}")
         raise RuntimeError(f"字幕翻译失败：{last_error or '未知错误'}")
 
-    def __translate_batch(self, cues: List[SubtitleCue], strict_mode: bool = False) -> List[str]:
+    def __translate_batch_with_failover(
+        self,
+        cues: List[SubtitleCue],
+        strict_mode: bool = False,
+        routes: Optional[List[TranslationRoute]] = None,
+        preferred_index: int = 0,
+    ) -> Tuple[List[str], TranslationRoute]:
+        active_routes = routes or self.__build_translation_routes()
+        if not active_routes:
+            raise RuntimeError("未配置可用翻译路由")
+        errors: List[str] = []
+        for offset in range(len(active_routes)):
+            self.__raise_if_cancelled()
+            route_index = (preferred_index + offset) % len(active_routes)
+            route = active_routes[route_index]
+            try:
+                if offset > 0:
+                    logger.warning(
+                        f"翻译路由切换为后备项：{self.__describe_translation_route(route)}"
+                    )
+                return self.__translate_batch(cues=cues, route=route, strict_mode=strict_mode), route
+            except Exception as err:
+                route_error = str(err)
+                errors.append(f"{self.__describe_translation_route(route)} -> {route_error}")
+                if len(active_routes) > 1:
+                    logger.warning(
+                        f"翻译路由失败：{self.__describe_translation_route(route)} -> {route_error}"
+                    )
+                else:
+                    raise
+        raise RuntimeError("所有翻译路由均失败：" + " | ".join(errors))
+
+    def __translate_batch(self, cues: List[SubtitleCue], route: TranslationRoute, strict_mode: bool = False) -> List[str]:
         self.__raise_if_cancelled()
-        endpoint = self.__build_translate_endpoint(self._translate_url)
+        endpoint = self.__build_translate_endpoint(route.url)
         prompt_lines = [
             f"{cue.index}\t{cue.text.replace(chr(10), ' / ')}"
             for cue in cues
         ]
         payload = {
-            "model": self._translate_model,
+            "model": route.model,
             "temperature": 0.2,
             "messages": [
                 {
@@ -3026,8 +3123,8 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             ],
         }
         headers = {"Content-Type": "application/json"}
-        if self._translate_api_key:
-            headers["Authorization"] = f"Bearer {self._translate_api_key}"
+        if route.api_key:
+            headers["Authorization"] = f"Bearer {route.api_key}"
 
         response = RequestUtils(
             headers=headers,
@@ -3050,6 +3147,91 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         if not message:
             raise RuntimeError("翻译接口未返回有效内容")
         return self.__parse_translate_output(message=message, cues=cues)
+
+    def __build_translation_routes(self) -> List[TranslationRoute]:
+        primary_url = (self._translate_url or "").strip()
+        primary_model = (self._translate_model or "").strip()
+        primary_api_key = (self._translate_api_key or "").strip()
+        routes: List[TranslationRoute] = []
+        seen = set()
+
+        def append_route(route: TranslationRoute) -> None:
+            normalized_url = (route.url or "").strip()
+            normalized_model = (route.model or "").strip()
+            normalized_api_key = (route.api_key or "").strip()
+            if not normalized_url:
+                raise RuntimeError("未配置翻译接口地址")
+            if not normalized_model:
+                raise RuntimeError("未配置翻译模型")
+            if "siliconflow.cn" in normalized_url.lower() and not normalized_api_key:
+                raise RuntimeError(f"{normalized_model} 缺少 API Key")
+            signature = (normalized_url, normalized_model, normalized_api_key)
+            if signature in seen:
+                return
+            seen.add(signature)
+            routes.append(
+                TranslationRoute(
+                    url=normalized_url,
+                    model=normalized_model,
+                    api_key=normalized_api_key,
+                    source=route.source,
+                )
+            )
+
+        append_route(
+            TranslationRoute(
+                url=primary_url,
+                model=primary_model,
+                api_key=primary_api_key,
+                source="primary",
+            )
+        )
+
+        fallback_lines = [
+            line.strip()
+            for line in str(self._translate_fallbacks or "").replace("\r", "\n").split("\n")
+            if line.strip()
+        ]
+        if len(fallback_lines) > MAX_TRANSLATION_FALLBACK_ROUTES:
+            logger.warning(
+                f"翻译后备路由配置超过上限，仅使用前 {MAX_TRANSLATION_FALLBACK_ROUTES} 个，其余将忽略"
+            )
+        for line in fallback_lines[:MAX_TRANSLATION_FALLBACK_ROUTES]:
+            route = self.__parse_translation_route_line(
+                line=line,
+                default_url=primary_url,
+                default_api_key=primary_api_key,
+            )
+            append_route(route)
+        return routes
+
+    @staticmethod
+    def __parse_translation_route_line(line: str, default_url: str, default_api_key: str) -> TranslationRoute:
+        parts = [part.strip() for part in (line or "").split("|")]
+        if len(parts) == 1:
+            return TranslationRoute(
+                url=default_url,
+                model=parts[0],
+                api_key=default_api_key,
+                source="fallback",
+            )
+        if len(parts) == 2:
+            return TranslationRoute(
+                url=parts[0],
+                model=parts[1],
+                api_key=default_api_key,
+                source="fallback",
+            )
+        return TranslationRoute(
+            url=parts[0],
+            model=parts[1],
+            api_key=parts[2],
+            source="fallback",
+        )
+
+    @staticmethod
+    def __describe_translation_route(route: TranslationRoute) -> str:
+        return f"{route.model} @ {route.url}"
 
     def __validate_translations(self, cues: List[SubtitleCue], translations: List[str]) -> None:
         if len(cues) != len(translations):
@@ -3285,6 +3467,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "translate_url": self._translate_url,
                 "translate_api_key": self._translate_api_key,
                 "translate_model": self._translate_model,
+                "translate_fallbacks": self._translate_fallbacks,
                 "translate_batch_size": self._translate_batch_size,
                 "translate_timeout": self._translate_timeout,
                 "test_text": self._test_text,

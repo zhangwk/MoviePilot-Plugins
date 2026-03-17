@@ -86,6 +86,7 @@ DEFAULT_SILICONFLOW_URL = "https://api.siliconflow.cn/v1"
 DEFAULT_TEST_TEXT = "We need to leave before sunrise, or we will miss the last train."
 DEFAULT_TRANSLATE_MODEL = "Qwen/Qwen2.5-32B-Instruct"
 DEFAULT_TRANSLATE_FALLBACKS = "deepseek-ai/DeepSeek-V3.2\nPro/MiniMaxAI/MiniMax-M2.5"
+DEFAULT_ENGLISH_OUTPUT_SUFFIX = "en.default"
 FFPROBE_TIMEOUT_SECONDS = 90
 FFMPEG_EXTRACT_TIMEOUT_SECONDS = 300
 AUDIO_EXTRACT_TIMEOUT_SECONDS = 900
@@ -345,7 +346,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.14"
+    plugin_version = "1.3.16"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -364,6 +365,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     _exclude_paths = ""
     _custom_files = ""
     _output_suffix = "zh.default"
+    _only_extract_english_subtitle = False
+    _save_english_subtitle = True
+    _english_output_suffix = DEFAULT_ENGLISH_OUTPUT_SUFFIX
     _ffmpeg_path = "ffmpeg"
     _ffprobe_path = "ffprobe"
     _enable_asr_fallback = False
@@ -402,6 +406,9 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             self._exclude_paths = config.get("exclude_paths") or ""
             self._custom_files = config.get("custom_files") or ""
             self._output_suffix = (config.get("output_suffix") or "zh.default").strip().strip(".")
+            self._only_extract_english_subtitle = bool(config.get("only_extract_english_subtitle"))
+            self._save_english_subtitle = bool(config.get("save_english_subtitle", True))
+            self._english_output_suffix = (config.get("english_output_suffix") or DEFAULT_ENGLISH_OUTPUT_SUFFIX).strip().strip(".")
             self._ffmpeg_path = (config.get("ffmpeg_path") or "ffmpeg").strip()
             self._ffprobe_path = (config.get("ffprobe_path") or "ffprobe").strip()
             self._enable_asr_fallback = bool(config.get("enable_asr_fallback"))
@@ -771,7 +778,20 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "only_extract_english_subtitle",
+                                            "label": "只提取英文字幕",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -785,7 +805,34 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "english_output_suffix",
+                                            "label": "英文字幕后缀",
+                                            "placeholder": f"默认 {DEFAULT_ENGLISH_OUTPUT_SUFFIX}",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "save_english_subtitle",
+                                            "label": "保存英文字幕到视频目录",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -926,7 +973,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": f"默认翻译路由已推荐为 {DEFAULT_TRANSLATE_MODEL}，后备模型为 DeepSeek-V3.2 和 MiniMax-M2.5。若主翻译模型不稳定，可在“翻译后备路由”里最多填写 2 个备用模型或备用端点，任务会自动切换；若没有可用字幕，可启用 faster-whisper 从英文音轨生成英文字幕，再翻译成中英双语字幕。",
+                                            "text": f"默认翻译路由已推荐为 {DEFAULT_TRANSLATE_MODEL}，后备模型为 DeepSeek-V3.2 和 MiniMax-M2.5。建议至少有 1 条后备路由使用不同的 translate_url，而不是只切同一接口下的模型；若开启“只提取英文字幕”，任务会直接输出英文 SRT 到视频目录并跳过翻译；若没有可用字幕，也可启用 faster-whisper 从英文音轨生成英文字幕。",
                                         },
                                     }
                                 ],
@@ -947,7 +994,10 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             "scan_paths": "",
             "exclude_paths": "",
             "custom_files": "",
+            "only_extract_english_subtitle": False,
             "output_suffix": "zh.default",
+            "save_english_subtitle": True,
+            "english_output_suffix": DEFAULT_ENGLISH_OUTPUT_SUFFIX,
             "ffmpeg_path": "ffmpeg",
             "ffprobe_path": "ffprobe",
             "enable_asr_fallback": False,
@@ -1871,7 +1921,11 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         if file_path.suffix.lower() not in settings.RMT_MEDIAEXT:
             return ProcessResult(file_path=str(file_path), status="skipped", mode="check", reason="不是支持的视频文件")
 
-        output_path = self.__build_output_path(file_path)
+        output_path = (
+            self.__build_english_output_path(file_path)
+            if self._only_extract_english_subtitle
+            else self.__build_output_path(file_path)
+        )
         if output_path.exists() and not self._overwrite:
             return ProcessResult(
                 file_path=str(file_path),
@@ -2008,6 +2062,17 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                     mode="extract",
                     reason=english_extract_error or "英文字幕流抽取后为空",
                     english_stream=str(english_candidates[0].index) if english_candidates else "",
+                )
+            self.__persist_english_subtitle(file_path=file_path, english_cues=english_cues, source_label="英文字幕抽取")
+            if self._only_extract_english_subtitle:
+                self.__update_task_stage("写出英文字幕文件", current_file=file_path, detail=output_path.name)
+                return ProcessResult(
+                    file_path=str(file_path),
+                    status="success",
+                    mode="english_extract",
+                    reason="已提取英文字幕到视频目录",
+                    output_path=str(output_path),
+                    english_stream=str(english_stream.index),
                 )
 
             chinese_text_stream = None
@@ -2295,6 +2360,18 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 logger.info(f"{file_path} Whisper 识别完成：生成英文字幕 {len(english_cues)} 条")
                 _write_srt_file(english_srt, english_cues)
                 self.__save_asr_cache(file_path=file_path, audio_stream=audio_stream, english_cues=english_cues)
+            self.__persist_english_subtitle(file_path=file_path, english_cues=english_cues, source_label="英文字幕识别")
+            if self._only_extract_english_subtitle:
+                english_output_path = self.__build_english_output_path(file_path)
+                self.__update_task_stage("写出英文字幕文件", current_file=file_path, detail=english_output_path.name)
+                return ProcessResult(
+                    file_path=str(file_path),
+                    status="success",
+                    mode="asr_english",
+                    reason="已通过音轨识别生成英文字幕并保存到视频目录",
+                    output_path=str(english_output_path),
+                    english_stream=str(audio_stream.index),
+                )
             self.__raise_if_cancelled(file_path)
             self.__update_task_stage("翻译英文字幕", current_file=file_path, detail=f"{len(english_cues)} 条")
             chinese_lines = self.__translate_cues(english_cues)
@@ -2685,6 +2762,27 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         except Exception as err:
             logger.warn(f"{file_path} 写入英文识别缓存失败：{str(err)}")
 
+    def __build_english_output_path(self, file_path: Path) -> Path:
+        suffix = (self._english_output_suffix or DEFAULT_ENGLISH_OUTPUT_SUFFIX).strip().strip(".")
+        return file_path.with_name(f"{file_path.stem}.{suffix}.srt")
+
+    def __persist_english_subtitle(self, file_path: Path, english_cues: List[SubtitleCue], source_label: str) -> None:
+        if (not self._save_english_subtitle and not self._only_extract_english_subtitle) or not english_cues:
+            return
+        english_output_path = self.__build_english_output_path(file_path)
+        try:
+            if english_output_path.exists() and not self._overwrite:
+                logger.info(
+                    f"{file_path} 已存在英文字幕文件，跳过保存：{english_output_path.name}"
+                )
+                return
+            _write_srt_file(english_output_path, english_cues)
+            logger.info(
+                f"{file_path} {source_label}已保存到视频目录：{english_output_path.name}，共 {len(english_cues)} 条"
+            )
+        except Exception as err:
+            logger.warn(f"{file_path} 保存英文字幕到视频目录失败：{str(err)}")
+
     def __extract_stream_to_srt(
         self,
         file_path: Path,
@@ -2989,6 +3087,12 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         total_batches = max(1, (len(english_cues) + self._translate_batch_size - 1) // self._translate_batch_size)
         routes = self.__build_translation_routes()
         current_route_index = 0
+        unique_route_urls = {self.__build_translate_endpoint(route.url) for route in routes}
+        if len(routes) > 1 and len(unique_route_urls) == 1:
+            logger.warning(
+                f"当前共配置 {len(routes)} 条翻译路由，但全部指向同一接口 {next(iter(unique_route_urls))}；"
+                "若接口整体无响应，仅切换模型无法规避，建议至少配置 1 条不同 translate_url 的后备路由"
+            )
         logger.info(
             f"开始批量翻译字幕：共 {len(english_cues)} 条，批大小 {self._translate_batch_size}，批次数 {total_batches}，路由数 {len(routes)}，首选 {self.__describe_translation_route(routes[0])}"
         )
@@ -3457,7 +3561,10 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 "scan_paths": self._scan_paths,
                 "exclude_paths": self._exclude_paths,
                 "custom_files": self._custom_files,
+                "only_extract_english_subtitle": self._only_extract_english_subtitle,
                 "output_suffix": self._output_suffix,
+                "save_english_subtitle": self._save_english_subtitle,
+                "english_output_suffix": self._english_output_suffix,
                 "ffmpeg_path": self._ffmpeg_path,
                 "ffprobe_path": self._ffprobe_path,
                 "enable_asr_fallback": self._enable_asr_fallback,

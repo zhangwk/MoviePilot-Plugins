@@ -346,7 +346,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.16"
+    plugin_version = "1.3.17"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -1426,16 +1426,30 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             if task is None:
                 continue
             self._current_task = task
-            self.__update_run_state(
-                task.run_id,
-                current_file=task.file_path,
-                stage="处理中",
-                running=True,
-            )
-            result = self.__process_single_path(Path(task.file_path), source=task.source)
-            self.__advance_run_state(task.run_id, result)
-            self._current_task = None
-            self._task_queue.task_done()
+            try:
+                logger.info(f"队列开始处理任务：{task.file_path}，来源：{task.source}")
+                self.__update_run_state(
+                    task.run_id,
+                    current_file=task.file_path,
+                    stage="处理中",
+                    running=True,
+                )
+                result = self.__process_single_path(Path(task.file_path), source=task.source)
+            except Exception as err:
+                logger.error(f"队列任务处理异常，已转为失败结果：{task.file_path} -> {str(err)}")
+                result = ProcessResult(
+                    file_path=str(task.file_path),
+                    status="failed",
+                    mode="queue",
+                    reason=f"任务队列处理异常：{str(err)}",
+                )
+            try:
+                self.__advance_run_state(task.run_id, result)
+            except Exception as err:
+                logger.error(f"更新任务运行状态失败：run_id={task.run_id}，file={task.file_path}，error={str(err)}")
+            finally:
+                self._current_task = None
+                self._task_queue.task_done()
             if self._cancel_event.is_set():
                 self._cancel_event.clear()
                 logger.info("内嵌双语字幕合成停止请求已处理完成")
@@ -1855,8 +1869,14 @@ class EmbeddedBilingualSubtitle(_PluginBase):
                 mode="runtime",
                 reason=str(err),
             )
-        self.__record_history(result, source=source)
-        self.__notify_single_result(result=result, source=source)
+        try:
+            self.__record_history(result, source=source)
+        except Exception as err:
+            logger.error(f"记录处理历史失败：{result.file_path} -> {str(err)}")
+        try:
+            self.__notify_single_result(result=result, source=source)
+        except Exception as err:
+            logger.error(f"发送处理通知失败：{result.file_path} -> {str(err)}")
         if result.status == "success":
             logger.info(f"双语字幕生成成功：{result.file_path} -> {result.output_path}")
         elif result.status == "failed":

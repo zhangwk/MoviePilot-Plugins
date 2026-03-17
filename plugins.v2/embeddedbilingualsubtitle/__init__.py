@@ -346,7 +346,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
     plugin_name = "内嵌双语字幕合成"
     plugin_desc = "抽取媒体文件内嵌字幕，合成为上英下中的外置双语字幕；缺少中文字幕时可翻译英文字幕。"
     plugin_icon = "bilingual_subtitle.svg"
-    plugin_version = "1.3.18"
+    plugin_version = "1.3.19"
     plugin_author = "zhangwk"
     author_url = "https://github.com/zhangwk/MoviePilot-Plugins"
     plugin_config_prefix = "embeddedbilingualsubtitle_"
@@ -1628,6 +1628,12 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         self._run_states[run_id]["total"] = queued
         if queued == 0:
             self._run_states[run_id]["stage"] = "无新任务"
+        if queued > 0:
+            logger.info("#" * 88)
+            logger.info(
+                f"批次开始：run_id={run_id}，来源：{source}，任务数：{queued}，首个任务：{paths[0]}"
+            )
+            logger.info("#" * 88)
         logger.info(f"已加入处理队列：{queued} 个文件，来源：{source}")
         return queued
 
@@ -1662,7 +1668,14 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         state["running"] = state["completed"] < state.get("total", 0)
         if not state["running"]:
             state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.__update_run_state(run_id, **state)
+        self.__update_run_state(run_id, **{key: value for key, value in state.items() if key != "run_id"})
+        if not state["running"]:
+            logger.info("#" * 88)
+            logger.info(
+                f"批次结束：run_id={run_id}，总数：{state.get('total', 0)}，"
+                f"成功：{state.get('success', 0)}，失败：{state.get('failed', 0)}，跳过：{state.get('skipped', 0)}"
+            )
+            logger.info("#" * 88)
 
     def __mark_run_tasks_skipped(self, run_id: str, count: int, stage: str):
         if count <= 0:
@@ -1676,7 +1689,7 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         state["running"] = state["completed"] < state.get("total", 0)
         if not state["running"]:
             state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.__update_run_state(run_id, **state)
+        self.__update_run_state(run_id, **{key: value for key, value in state.items() if key != "run_id"})
 
     def __terminate_active_process(self) -> bool:
         with self._active_process_lock:
@@ -1846,8 +1859,8 @@ class EmbeddedBilingualSubtitle(_PluginBase):
         return False
 
     def __process_single_path(self, file_path: Path, source: str) -> ProcessResult:
-        logger.info("=" * 72)
-        logger.info(f"任务开始：{file_path}")
+        logger.info("-" * 72)
+        logger.info(f"子任务开始：{file_path}")
         logger.info(f"开始处理内嵌字幕：{file_path}")
         try:
             with ffmpeg_lock:
@@ -1887,8 +1900,8 @@ class EmbeddedBilingualSubtitle(_PluginBase):
             logger.error(f"双语字幕生成失败：{result.file_path}，原因：{result.reason}")
         else:
             logger.info(f"双语字幕跳过：{result.file_path}，原因：{result.reason}")
-        logger.info(f"任务结束：{result.file_path}，状态：{result.status}，模式：{result.mode}")
-        logger.info("=" * 72)
+        logger.info(f"子任务结束：{result.file_path}，状态：{result.status}，模式：{result.mode}")
+        logger.info("-" * 72)
         return result
 
     def __normalize_media_input(self, file_path: Path) -> Union[Path, ProcessResult]:
